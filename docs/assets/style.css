@@ -81,6 +81,7 @@ input,select,textarea{font:inherit;color:inherit}
 .btn-ghost{background:var(--card);box-shadow:var(--shadow)}
 .btn-ok{color:#fff;background:linear-gradient(135deg,#12b76a,#0ca678);box-shadow:0 10px 22px -10px rgba(18,183,106,.9)}
 .btn-warn{color:#fff;background:linear-gradient(135deg,#f79009,#f5b400)}
+.reset-topbar{display:flex;justify-content:flex-end;margin-bottom:12px}
 .btn-bad{color:#fff;background:linear-gradient(135deg,#f04438,#d6336c)}
 .btn-fix{color:#fff;background:linear-gradient(135deg,#7a5af8,#9e77ed)}
 .btn-sm{padding:7px 13px;font-size:13px;border-radius:11px}

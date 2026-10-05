@@ -1120,7 +1120,7 @@ test("docs JS files parse (new Function)", () => {
   assert.ok(app.includes("resetPassword: pw }"));
   assert.ok(/data-medit=.*✏️ แก้ไข/.test(app) && /data-mdel=.*🗑 ลบ/.test(app) && /data-redit=.*data-rdel=/.test(app));
   const html = fs.readFileSync(path.join(ROOT, "docs/index.html"), "utf8");
-  assert.ok(html.includes('assets/app.js?v=13"'));
+  assert.ok(html.includes('assets/app.js?v=14"'));
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

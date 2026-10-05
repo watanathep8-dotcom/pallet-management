@@ -362,6 +362,7 @@ async function dashboard() {
   const conn = (a, label, label2, b) => `<div class="fconn"><small>${label}</small><div class="ln" style="--a:${a}"></div>${label2 ? `<div class="ln rev" style="--a:${b}"></div><small>${label2}</small>` : ''}</div>`;
 
   view.innerHTML = `
+  <div class="reset-topbar"><button class="btn btn-bad" id="resetBtn">🗑 รีเซ็ตข้อมูล / Reset data</button></div>
   <div class="hero">
     <div class="leafs">${[12, 30, 48, 66, 84].map((l, i) => `<i class="fa-solid fa-leaf" style="left:${l}%;bottom:-20px;font-size:${18 + i * 6}px;animation-delay:${-i * 2.6}s"></i>`).join('')}</div>
     <div class="greet"><i class="fa-solid ${greet[1]}"></i>${greet[0]}${S.user ? ' คุณ' + esc(S.user) : ''} · ${new Date().toLocaleDateString('th-TH', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}</div>
@@ -442,6 +443,7 @@ async function dashboard() {
     $$('.gauge circle.v').forEach(c => c.style.strokeDashoffset = c.dataset.off);
   }, 150);
   $$('.tcard').forEach(c => c.onclick = () => location.hash = 'stock');
+  $('#resetBtn').onclick = resetData;
   view.onclick = e => {
     const g = e.target.closest('[data-go]'); if (g) location.hash = g.dataset.go;
     const sb = e.target.closest('[data-days]'); if (sb) { sessionSet('dashDays', sb.dataset.days); route(); }
@@ -991,11 +993,7 @@ async function settings() {
       <div class="field mt"><label>ไอคอน</label><div class="icon-pick">${icons.map(i => `<button data-ic="${i}" class="${i === ic ? 'sel' : ''}"><i class="fa-solid ${i}"></i></button>`).join('')}</div></div>
       <div class="field mt"><label>สี</label><div class="color-pick">${colors.map(c => `<button data-col="${c}" style="--c:${c}" class="${c === col ? 'sel' : ''}"></button>`).join('')}</div></div>
       <button class="btn btn-primary mt" id="dSave" style="width:100%"><i class="fa-solid fa-floppy-disk"></i>บันทึก</button>
-    </div></div>
-    <div class="card mt" style="border:2px solid var(--bad)"><h3><i class="fa-solid fa-triangle-exclamation" style="color:var(--bad)"></i>ล้างข้อมูลทดสอบ<span class="sub">ย้อนกลับไม่ได้</span></h3>
-      <p style="color:var(--muted)">ลบประวัติเคลื่อนไหว งานซ่อม และบันทึกประวัติ (Log) ทั้งหมด เพื่อเริ่มใช้งานใหม่ — ประเภทพาเลทและรายชื่อฝ่ายยังอยู่ ต้องใช้รหัสรีเซ็ตข้อมูล (แยกจากรหัสบันทึกปกติ)</p>
-      <button class="btn btn-bad mt" id="resetBtn">🗑 รีเซ็ตข้อมูล / Reset data</button>
-    </div>`;
+    </div></div>`;
   view.onclick = async e => {
     const i = e.target.closest('[data-ic]'), c = e.target.closest('[data-col]'), d = e.target.closest('[data-del]');
     if (i) { ic = i.dataset.ic; $$('[data-ic]').forEach(x => x.classList.toggle('sel', x === i)); }
@@ -1009,7 +1007,6 @@ async function settings() {
     try { const r = await api('dept_save', { name: $('#dName').value, icon: ic, color: col }); toast(r.message); route(); }
     catch (e) { toast(e.message, 'err'); }
   };
-  $('#resetBtn').onclick = resetData;
 }
 
 /* รีเซ็ตข้อมูล: ถามรหัสรีเซ็ต (ใช้ครั้งเดียว ไม่เก็บไว้) → ยืนยัน → POST reset_data */
