@@ -4,48 +4,69 @@
  * Setup (once): run setupSystem() from the Apps Script editor. It creates the
  * "Pallet Hub Database" spreadsheet (one sheet per table, header row on top),
  * seeds the pallet types and departments, and stores the spreadsheet ID in
- * Script Properties (PALLET_SPREADSHEET_ID). Then set the shared password in
- * Project Settings > Script properties > PALLET_ACTION_PASSWORD and deploy as
- * a web app (Execute as: me, Who has access: Anyone).
+ * Script Properties (PALLET_SPREADSHEET_ID). Then deploy as a web app
+ * (Execute as: me, Who has access: Anyone).
+ *
+ * Login: every action (reads and writes) needs a session token obtained from
+ * the "login" action (username + password of a row in the "users" sheet).
+ * The first admin: while the users sheet is empty, logging in as "admin" with
+ * the password stored in Script property PALLET_INITIAL_ADMIN_PASSWORD
+ * creates the admin account (the property is not used after that). Admins
+ * manage the other accounts (users, user_save, user_reset_password,
+ * user_toggle). The server records the logged-in user (fullname + username)
+ * on every movement, repair ticket and audit_logs row.
  *
  * Optional: set Script property PALLET_RESET_PASSWORD (a separate password)
  * to enable the "reset_data" action, which wipes movements, repairs and
- * audit_logs (pallet types and departments are kept). The same reset password
- * (and the same lockout counter) also protects editing / deleting individual
- * records: movement_update, movement_delete, repair_update, repair_delete.
- * Every edit/delete is validated by replaying all movements in time order
- * (see validateLedger_) so stock and department balances never go negative.
+ * audit_logs (pallet types, departments and users are kept). The same reset
+ * password (and the same lockout counter) also protects editing / deleting
+ * individual records: movement_update, movement_delete, repair_update,
+ * repair_delete. Every edit/delete is validated by replaying all movements in
+ * time order (see validateLedger_) so stock and department balances never go
+ * negative.
  *
  * Transport:
- *   GET  ?action=<read action>&...params        -> {ok:true,data} | {ok:false,error}
- *   POST text/plain JSON {action, password, actor, ...fields}
- *
- * Every write action requires the shared password. Reading is public.
+ *   GET  ?action=<read action>&token=<session>&...params -> {ok:true,data} | {ok:false,error[,code]}
+ *   POST text/plain JSON {action, token, ...fields}
+ *   Not logged in / session expired -> {ok:false, code:"AUTH", error:"กรุณาเข้าสู่ระบบ"}
  */
 
 var SPREADSHEET_ID_PROPERTY = "PALLET_SPREADSHEET_ID";
 var SPREADSHEET_NAME = "Pallet Hub Database";
 
-// The shared password is stored ONLY in Script Properties (Project Settings >
-// Script properties > PALLET_ACTION_PASSWORD) so it never appears in source.
-// Repeated wrong attempts temporarily lock the check to slow down guessing.
-var ACTION_PASSWORD_PROPERTY = "PALLET_ACTION_PASSWORD";
-var PASSWORD_FAIL_CACHE_KEY = "PALLET_PASSWORD_FAILURES";
-var PASSWORD_MAX_FAILURES = 10;
-var PASSWORD_LOCK_SECONDS = 900;
-
-// Separate password (Script Property only) for wiping test data, with its own
-// lockout counter so it cannot be guessed via, or lock out, normal writes.
+// Reset password (Script Property only) for wiping test data and for editing
+// / deleting records, with its own lockout counter. Wrong attempts beyond
+// PASSWORD_MAX_FAILURES within PASSWORD_LOCK_SECONDS lock the check.
 var RESET_ACTION = "reset_data";
 var RESET_PASSWORD_PROPERTY = "PALLET_RESET_PASSWORD";
 var RESET_FAIL_CACHE_KEY = "PALLET_RESET_FAILURES";
-var RESET_TABLES = ["movements", "repairs", "audit_logs"]; // pallet_types/departments are kept
-// Record maintenance actions: protected by PALLET_RESET_PASSWORD only.
+var PASSWORD_MAX_FAILURES = 10;
+var PASSWORD_LOCK_SECONDS = 900;
+var RESET_TABLES = ["movements", "repairs", "audit_logs"]; // pallet_types/departments/users are kept
+// Record maintenance actions: protected by PALLET_RESET_PASSWORD (plus the session).
 var RECORD_ACT_NAME = {
   movement_update: "แก้ไขรายการ", movement_delete: "ลบรายการ",
   repair_update: "แก้ไขใบแจ้งซ่อม", repair_delete: "ลบใบแจ้งซ่อม"
 };
 var RESET_PASSWORD_ACTIONS = [RESET_ACTION, "movement_update", "movement_delete", "repair_update", "repair_delete"];
+
+// Accounts / sessions (same approach as work-permit Auth.gs): random salt +
+// iterated SHA-256, sessions in CacheService bound to the user's salt, so a
+// password change/reset or disabling the account ends existing sessions.
+var INITIAL_ADMIN_PASSWORD_PROPERTY = "PALLET_INITIAL_ADMIN_PASSWORD";
+var INITIAL_ADMIN_USERNAME = "admin";
+var INITIAL_ADMIN_FULLNAME = "ผู้ดูแลระบบ";
+var HASH_ROUNDS = 5000;
+var SESSION_TTL = 21600;             // 6 h (CacheService maximum)
+var SESSION_PREFIX = "PALLET_SESSION_";
+var LOGIN_FAIL_PREFIX = "PALLET_LOGIN_FAILURES_";
+var LOGIN_MAX_FAILURES = 10;
+var LOGIN_LOCK_SECONDS = 900;        // 15 min
+var PASSWORD_MIN = 8;
+var PASSWORD_MAX = 200;
+var USERNAME_RE = /^[a-z0-9._-]{3,30}$/;
+var ROLES = ["admin", "user"];
+var AUTH_MESSAGE = "กรุณาเข้าสู่ระบบ";
 
 // Asia/Bangkok has no daylight saving time, so a fixed +07:00 offset gives the
 // same wall-clock values as PHP's date_default_timezone_set('Asia/Bangkok').
@@ -53,7 +74,9 @@ var TZ_OFFSET_MS = 7 * 60 * 60 * 1000;
 
 /* Column definitions (same columns as the MySQL tables in config.php).
  * Types: int, str, dt ("YYYY-MM-DD HH:MM:SS"). A trailing "?" marks columns
- * that are NULL in MySQL when empty (returned to the client as null). */
+ * that are NULL in MySQL when empty (returned to the client as null).
+ * New columns are only ever APPENDED: sheets created before a column existed
+ * get it added at the end of their header row on first use (see table_). */
 var SCHEMA = {
   pallet_types: [
     ["id", "int"], ["tkey", "str"], ["code", "str"], ["name", "str"], ["short", "str"],
@@ -66,19 +89,30 @@ var SCHEMA = {
     ["id", "int"], ["ticket_no", "str"], ["type_id", "int"], ["size", "str"], ["qty", "int"],
     ["stage", "str"], ["source", "str"], ["department", "str?"], ["cause", "str"],
     ["reported_by", "str"], ["repairer", "str"], ["reported_at", "dt"], ["started_at", "dt?"],
-    ["finished_at", "dt?"], ["note", "str"]
+    ["finished_at", "dt?"], ["note", "str"],
+    // added with login: who opened / last changed the ticket (server-side)
+    ["reported_username", "str"], ["updated_by", "str"], ["updated_username", "str"], ["updated_at", "dt?"]
   ],
   movements: [
     ["id", "int"], ["doc_no", "str"], ["action", "str"], ["type_id", "int"], ["size", "str"],
     ["qty", "int"], ["from_status", "str?"], ["to_status", "str?"], ["department", "str?"],
-    ["person", "str"], ["note", "str"], ["repair_id", "int?"], ["moved_at", "dt"], ["created_at", "dt"]
+    ["person", "str"], ["note", "str"], ["repair_id", "int?"], ["moved_at", "dt"], ["created_at", "dt"],
+    // added with login: logged-in user ("fullname (username)") — person stays an optional free-text name
+    ["actor", "str"], ["username", "str"]
   ],
   audit_logs: [
     ["id", "int"], ["category", "str"], ["action", "str"], ["ref", "str"], ["detail", "str"],
-    ["actor", "str"], ["ip", "str"], ["created_at", "dt"]
+    ["actor", "str"], ["ip", "str"], ["created_at", "dt"],
+    ["username", "str"] // added with login
+  ],
+  users: [
+    ["id", "int"], ["username", "str"], ["password_hash", "str"], ["salt", "str"], ["fullname", "str"],
+    ["role", "str"], ["active", "int"], ["created_at", "dt"], ["updated_at", "dt?"], ["last_login", "dt?"]
   ]
 };
-var TABLE_ORDER = ["pallet_types", "departments", "repairs", "movements", "audit_logs"];
+var TABLE_ORDER = ["pallet_types", "departments", "repairs", "movements", "audit_logs", "users"];
+// Sheets that are created on demand when missing (spreadsheets made before they existed).
+var AUTO_CREATE_TABLES = ["users"];
 
 var SEED_TYPES = [
   ["RM", "RM", "พาเลทสำหรับใส่ RM", "วัตถุดิบ (RM)", "วัตถุดิบ", "#1E6FE0", "1.2x1.2", 1],
@@ -108,10 +142,15 @@ var ACT_NAME = {
 var STATUS_NAME = {
   available: "พร้อมใช้", issued: "เบิกไปใช้งาน", damaged: "ชำรุด", repairing: "กำลังซ่อม", scrapped: "ตัดจำหน่าย"
 };
-var LOG_CAT_NAME = { pallet: "รายการพาเลท", repair: "งานซ่อม", setting: "ตั้งค่า", warn: "ถูกปฏิเสธ" };
+var LOG_CAT_NAME = { pallet: "รายการพาเลท", repair: "งานซ่อม", setting: "ตั้งค่า", warn: "ถูกปฏิเสธ", account: "บัญชีผู้ใช้" };
 
-var READ_ACTIONS = ["bootstrap", "dashboard", "repairs", "history", "export", "logs", "logs_export"];
+var READ_ACTIONS = ["bootstrap", "dashboard", "repairs", "history", "export", "logs", "logs_export", "me", "users"];
 var WRITE_ACTIONS = ["receive", "issue", "return", "damage", "repair_start", "repair_done", "scrap", "dept_save", "dept_delete"];
+// Account actions that write (POST, session required, run under the script lock).
+var ACCOUNT_ACTIONS = ["logout", "change_password", "user_save", "user_reset_password", "user_toggle"];
+var ADMIN_ACTIONS = ["users", "user_save", "user_reset_password", "user_toggle"];
+var POST_ONLY_ACTIONS = ["login", "verifyResetPassword"]
+  .concat(WRITE_ACTIONS, RESET_PASSWORD_ACTIONS, ACCOUNT_ACTIONS);
 
 // Length limits of the MySQL VARCHAR columns that store user text.
 var MAX_PERSON = 100;
@@ -125,11 +164,10 @@ function doGet(e) {
   var action = String(params.action || "");
   try {
     if (!action) return jsonResponse_({ ok: true, data: { service: "Pallet Hub API" } });
-    if (WRITE_ACTIONS.indexOf(action) !== -1 || action === "verifyPassword" || action === "verifyResetPassword" ||
-        RESET_PASSWORD_ACTIONS.indexOf(action) !== -1) {
-      throw new Error("คำสั่งนี้ต้องส่งแบบ POST");
-    }
-    resetRequest_("");
+    if (POST_ONLY_ACTIONS.indexOf(action) !== -1) throw new Error("คำสั่งนี้ต้องส่งแบบ POST");
+    if (READ_ACTIONS.indexOf(action) === -1) fail_("Unknown action");
+    resetRequest_(null);
+    authenticate_(params.token, action);
     return jsonResponse_({ ok: true, data: handleRead_(action, params) });
   } catch (error) {
     return errorResponse_(error);
@@ -146,45 +184,38 @@ function doPost(e) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) payload = {};
   var action = String(payload.action || "");
 
+  var user;
   try {
-    if (action === "verifyPassword") {
-      return jsonResponse_({ ok: true, data: verifyActionPassword(payload.password) });
+    if (action === "login") return jsonResponse_({ ok: true, data: actionLogin_(payload) });
+    if (POST_ONLY_ACTIONS.indexOf(action) === -1 && READ_ACTIONS.indexOf(action) === -1) fail_("Unknown action");
+    resetRequest_(null);
+    // Session first: nothing below (including the reset-password check and its
+    // lockout counter) is reachable without being logged in.
+    user = authenticate_(payload.token, action);
+    if (READ_ACTIONS.indexOf(action) !== -1) {
+      return jsonResponse_({ ok: true, data: handleRead_(action, payload) });
     }
     if (action === "verifyResetPassword") {
       return jsonResponse_({ ok: true, data: verifyResetPassword(payload.resetPassword) });
     }
-    if (RESET_PASSWORD_ACTIONS.indexOf(action) !== -1) {
-      // Uses ONLY the reset password (PALLET_ACTION_PASSWORD is not required).
-      assertResetPassword_(payload.resetPassword);
-    } else {
-      if (WRITE_ACTIONS.indexOf(action) === -1) {
-        if (READ_ACTIONS.indexOf(action) !== -1) {
-          resetRequest_("");
-          return jsonResponse_({ ok: true, data: handleRead_(action, payload) });
-        }
-        throw new Error("Unknown action");
-      }
-      // Checked before taking the lock so password guessing (with its 1 s delay)
-      // never blocks legitimate writers. Wrong passwords are not written to the
-      // audit log: unauthenticated requests must not be able to write the sheet.
-      assertActionPassword_(payload.password);
-    }
+    // reset_data and record edits/deletes additionally need the reset password.
+    // Checked before taking the lock so guessing (1 s delay) never blocks writers.
+    if (RESET_PASSWORD_ACTIONS.indexOf(action) !== -1) assertResetPassword_(payload.resetPassword);
   } catch (error) {
     return errorResponse_(error);
   }
-  return runWrite_(action, payload);
+  return runWrite_(action, payload, user);
 }
 
-function runWrite_(action, input) {
+function runWrite_(action, input, user) {
   var lock = LockService.getScriptLock();
   try {
     lock.waitLock(30000);
   } catch (lockError) {
     return jsonResponse_({ ok: false, error: "ระบบกำลังบันทึกรายการอื่นอยู่ กรุณาลองใหม่อีกครั้ง" });
   }
-  var actor = mbSubstr_(phpTrim_(str_(input.actor)), 0, MAX_PERSON);
   try {
-    resetRequest_(actor);
+    resetRequest_(user);
     try {
       var result = handleWrite_(action, input);
       flush_();
@@ -195,10 +226,8 @@ function runWrite_(action, input) {
       var actName = ACT_NAME[action] || RECORD_ACT_NAME[action];
       if (actName) {
         try {
-          resetRequest_(actor);
-          // Record edits: input.person is the record's new value, not the actor.
-          var who = RECORD_ACT_NAME[action] ? "" : phpTrim_(safeStr_(input.person));
-          audit_("warn", action, "ปฏิเสธ" + actName + ": " + message, "", who);
+          resetRequest_(user);
+          audit_("warn", action, "ปฏิเสธ" + actName + ": " + message, "");
           flush_();
         } catch (ignored) {}
       }
@@ -209,22 +238,29 @@ function runWrite_(action, input) {
   }
 }
 
-/* ===================== password ===================== */
-
-function verifyActionPassword(password) {
-  assertActionPassword_(password);
-  return { valid: true };
+// Runs fn under the script lock with a fresh request state and flushes its writes.
+function withLock_(user, fn) {
+  var lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(30000);
+  } catch (lockError) {
+    fail_("ระบบกำลังบันทึกรายการอื่นอยู่ กรุณาลองใหม่อีกครั้ง");
+  }
+  try {
+    resetRequest_(user);
+    var result = fn();
+    flush_();
+    return result;
+  } finally {
+    lock.releaseLock();
+  }
 }
+
+/* ===================== reset password ===================== */
 
 function verifyResetPassword(password) {
   assertResetPassword_(password);
   return { valid: true };
-}
-
-function assertActionPassword_(password) {
-  checkPassword_(password, ACTION_PASSWORD_PROPERTY, PASSWORD_FAIL_CACHE_KEY,
-    "ยังไม่ได้ตั้งรหัสผ่านใน Script Properties (" + ACTION_PASSWORD_PROPERTY +
-    ") กรุณาให้ผู้ดูแลระบบตั้งค่าที่ Project Settings > Script properties ก่อนบันทึกข้อมูล");
 }
 
 function assertResetPassword_(password) {
@@ -258,6 +294,341 @@ function passwordError_(message) {
   return error;
 }
 
+/* ===================== accounts & sessions ===================== */
+
+function cache_() {
+  return CacheService.getScriptCache();
+}
+
+function hashPassword_(password, salt) {
+  var alg = Utilities.DigestAlgorithm.SHA_256;
+  var h = Utilities.computeDigest(alg, salt + ":" + password, Utilities.Charset.UTF_8);
+  for (var i = 1; i < HASH_ROUNDS; i++) h = Utilities.computeDigest(alg, h);
+  return bytesToHex_(h);
+}
+
+function passwordFields_(password) {
+  var salt = randomHex_(32);
+  return { salt: salt, password_hash: hashPassword_(password, salt) };
+}
+
+function verifyUserPassword_(u, password) {
+  return safeEqual_(hashPassword_(String(password), u.salt), u.password_hash);
+}
+
+function bytesToHex_(bytes) {
+  var out = [];
+  for (var i = 0; i < bytes.length; i++) {
+    var b = bytes[i] & 0xff;
+    out.push((b < 16 ? "0" : "") + b.toString(16));
+  }
+  return out.join("");
+}
+
+function sha256Hex_(s) {
+  return bytesToHex_(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, s, Utilities.Charset.UTF_8));
+}
+
+// Random lowercase hex string of length n (UUIDs + Math.random mixed through SHA-256).
+function randomHex_(n) {
+  var out = "";
+  while (out.length < n) {
+    out += sha256Hex_(Utilities.getUuid() + ":" + Utilities.getUuid() + ":" + Math.random() + ":" + Date.now() + ":" + out);
+  }
+  return out.substring(0, n);
+}
+
+// Constant-time string comparison.
+function safeEqual_(a, b) {
+  a = String(a || "");
+  b = String(b || "");
+  if (a.length !== b.length || !a.length) return false;
+  var diff = 0;
+  for (var i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+// "fullname (username)" — the name recorded on every row the user writes.
+function actorLabel_(u) {
+  if (!u) return "";
+  return phpEmpty_(u.fullname) ? u.username : u.fullname + " (" + u.username + ")";
+}
+
+function publicUser_(u) {
+  return {
+    id: u.id, username: u.username, fullname: u.fullname, role: u.role, active: u.active === 1,
+    created_at: u.created_at, updated_at: u.updated_at, last_login: u.last_login
+  };
+}
+
+function findUserByName_(username) {
+  var key = String(username).toLowerCase();
+  var rows = table_("users").rows;
+  for (var i = 0; i < rows.length; i++) if (String(rows[i].username).toLowerCase() === key) return rows[i];
+  return null;
+}
+
+function findUserById_(id) {
+  var rows = table_("users").rows;
+  for (var i = 0; i < rows.length; i++) if (rows[i].id === id) return rows[i];
+  return null;
+}
+
+function newSession_(u) {
+  var token = randomHex_(64);
+  cache_().put(SESSION_PREFIX + token, JSON.stringify({ uid: u.id, sv: u.salt }), SESSION_TTL);
+  return token;
+}
+
+function authError_() {
+  var error = new Error(AUTH_MESSAGE);
+  error.code = "AUTH";
+  return error;
+}
+
+// Returns the logged-in user (and sets REQ_.user / actor) or throws AUTH.
+// The session is bound to the user's salt and checked against the live users
+// sheet, so disabled accounts and changed/reset passwords lose their sessions.
+function authenticate_(token, action) {
+  token = String(token == null ? "" : token);
+  if (!/^[a-f0-9]{64}$/.test(token)) throw authError_();
+  var raw = cache_().get(SESSION_PREFIX + token);
+  var s = null;
+  try { s = raw ? JSON.parse(raw) : null; } catch (ignored) { s = null; }
+  if (!s) throw authError_();
+  var u = findUserById_(Number(s.uid));
+  if (!u || u.active !== 1 || !safeEqual_(u.salt, s.sv)) {
+    cache_().remove(SESSION_PREFIX + token);
+    throw authError_();
+  }
+  u = plain_(u);
+  u.token = token;
+  if (ADMIN_ACTIONS.indexOf(action) !== -1 && u.role !== "admin") {
+    fail_("เฉพาะผู้ดูแลระบบเท่านั้น / Admins only", "FORBIDDEN");
+  }
+  setUser_(u);
+  return u;
+}
+
+function setUser_(u) {
+  REQ_.user = u;
+  REQ_.actor = actorLabel_(u);
+  REQ_.username = u ? u.username : "";
+}
+
+function loginFailKey_(username) {
+  return LOGIN_FAIL_PREFIX + sha256Hex_(String(username).toLowerCase()).slice(0, 40);
+}
+
+/*
+ * login {username, password} -> {token, expires_in, user}
+ * While the users sheet is empty, "admin" + PALLET_INITIAL_ADMIN_PASSWORD
+ * creates the first admin. Failed attempts are counted per username (10 per
+ * 15 min, then locked), cost 1 s each and are written to audit_logs.
+ */
+function actionLogin_(p) {
+  var username = phpTrim_(typeof p.username === "string" ? p.username : "").toLowerCase();
+  var password = typeof p.password === "string" ? p.password : "";
+  if (!username || !password) fail_("กรุณากรอกชื่อผู้ใช้และรหัสผ่าน", "LOGIN_FAILED");
+  username = mbSubstr_(username, 0, 60);
+  var cache = cache_();
+  var failKey = loginFailKey_(username);
+  var fails = Number(cache.get(failKey) || 0);
+  if (fails >= LOGIN_MAX_FAILURES) {
+    fail_("เข้าสู่ระบบผิดเกิน " + LOGIN_MAX_FAILURES + " ครั้ง ชื่อผู้ใช้นี้ถูกระงับชั่วคราว 15 นาที กรุณารอแล้วลองใหม่", "LOCKED");
+  }
+
+  resetRequest_(null);
+  var initial = !table_("users").rows.length; // also creates the users sheet when missing
+  var verifiedSalt = null;
+  if (initial) {
+    if (username === INITIAL_ADMIN_USERNAME) {
+      var initialPw = PropertiesService.getScriptProperties().getProperty(INITIAL_ADMIN_PASSWORD_PROPERTY) || "";
+      if (!initialPw) {
+        fail_("ยังไม่มีบัญชีผู้ใช้ในระบบ — กรุณาให้ผู้ดูแลระบบตั้ง Script Property " + INITIAL_ADMIN_PASSWORD_PROPERTY +
+          " (Project Settings > Script properties) แล้วเข้าสู่ระบบด้วยชื่อผู้ใช้ admin และรหัสผ่านนั้น", "SETUP");
+      }
+      if (safeEqual_(password, initialPw)) verifiedSalt = "initial";
+    }
+  } else {
+    var u = findUserByName_(username);
+    if (u && u.active === 1 && verifyUserPassword_(u, password)) verifiedSalt = u.salt;
+  }
+
+  if (!verifiedSalt) {
+    cache.put(failKey, String(fails + 1), LOGIN_LOCK_SECONDS);
+    Utilities.sleep(1000);
+    try {
+      withLock_(null, function () {
+        REQ_.username = username;
+        audit_("account", "login_failed", "เข้าสู่ระบบไม่สำเร็จ: ชื่อผู้ใช้ \"" + username + "\" (ครั้งที่ " + (fails + 1) + ")" +
+          (fails + 1 >= LOGIN_MAX_FAILURES ? " — ระงับชื่อผู้ใช้นี้ชั่วคราว 15 นาที" : ""), "");
+      });
+    } catch (ignored) {}
+    fail_("ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง", "LOGIN_FAILED");
+  }
+
+  return withLock_(null, function () {
+    var now = nowParts_().datetime;
+    var user;
+    if (!table_("users").rows.length) {
+      if (verifiedSalt !== "initial") fail_("ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง", "LOGIN_FAILED");
+      var pf = passwordFields_(password);
+      user = insert_("users", {
+        username: INITIAL_ADMIN_USERNAME, password_hash: pf.password_hash, salt: pf.salt,
+        fullname: INITIAL_ADMIN_FULLNAME, role: "admin", active: 1, created_at: now, updated_at: null, last_login: now
+      });
+      setUser_(user);
+      audit_("account", "user_create", "สร้างบัญชีผู้ดูแลระบบเริ่มต้น \"" + INITIAL_ADMIN_USERNAME +
+        "\" จาก Script Property " + INITIAL_ADMIN_PASSWORD_PROPERTY + " (ควรเปลี่ยนรหัสผ่าน)", INITIAL_ADMIN_USERNAME);
+    } else {
+      user = findUserByName_(username);
+      // Re-checked under the lock; the hash was verified above for this salt.
+      if (!user || user.active !== 1 || !safeEqual_(user.salt, verifiedSalt)) {
+        fail_("ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง", "LOGIN_FAILED");
+      }
+      update_("users", user, { last_login: now });
+      setUser_(user);
+    }
+    cache.remove(failKey);
+    audit_("account", "login", "เข้าสู่ระบบ", user.username);
+    return { token: newSession_(user), expires_in: SESSION_TTL, user: publicUser_(user), initial: verifiedSalt === "initial" };
+  });
+}
+
+function actionLogout_() {
+  cache_().remove(SESSION_PREFIX + REQ_.user.token);
+  audit_("account", "logout", "ออกจากระบบ", REQ_.username);
+  return { message: "ออกจากระบบแล้ว" };
+}
+
+function actionMe_() {
+  return { user: publicUser_(findUserById_(REQ_.user.id) || REQ_.user) };
+}
+
+function actionUsers_() {
+  return {
+    me: REQ_.user.id,
+    users: sortBy_(table_("users").rows.slice(), function (a, b) { return a.id - b.id; }).map(publicUser_)
+  };
+}
+
+function passwordIn_(v, label) {
+  var pw = typeof v === "string" ? v : "";
+  if (pw.length < PASSWORD_MIN) fail_(label + "ต้องมีอย่างน้อย " + PASSWORD_MIN + " ตัวอักษร");
+  if (pw.length > PASSWORD_MAX) fail_(label + "ยาวเกิน " + PASSWORD_MAX + " ตัวอักษร");
+  return pw;
+}
+
+function liveUser_(id) {
+  var u = findUserById_(phpInt_(id));
+  if (!u) fail_("ไม่พบผู้ใช้ (อาจถูกลบไปแล้ว) กรุณาโหลดหน้าใหม่");
+  return u;
+}
+
+// At least one active admin must remain after the proposed change of user u.
+function assertAdminRemains_(u, role, active) {
+  var n = 0;
+  table_("users").rows.forEach(function (r) {
+    var rr = r === u ? role : r.role;
+    var ra = r === u ? active : r.active;
+    if (rr === "admin" && ra === 1) n++;
+  });
+  if (!n) fail_("ต้องมีผู้ดูแลระบบที่ใช้งานอยู่อย่างน้อย 1 คน — ไม่สามารถปิดการใช้งานหรือลดสิทธิ์ผู้ดูแลระบบคนสุดท้ายได้");
+}
+
+function roleName_(r) { return r === "admin" ? "ผู้ดูแลระบบ" : "ผู้ใช้งาน"; }
+function activeName_(a) { return a === 1 ? "ใช้งาน" : "ปิดใช้งาน"; }
+
+// Own password: {old_password, new_password}. A wrong old password counts toward
+// the login lockout of this username. Returns a new token (other sessions end).
+function actionChangePassword_(input) {
+  var u = liveUser_(REQ_.user.id);
+  var failKey = loginFailKey_(u.username);
+  var fails = Number(cache_().get(failKey) || 0);
+  if (fails >= LOGIN_MAX_FAILURES) fail_("ใส่รหัสผ่านผิดหลายครั้งเกินไป กรุณารอ 15 นาที", "LOCKED");
+  var oldPw = typeof input.old_password === "string" ? input.old_password : "";
+  if (!oldPw || !verifyUserPassword_(u, oldPw)) {
+    cache_().put(failKey, String(fails + 1), LOGIN_LOCK_SECONDS);
+    Utilities.sleep(1000);
+    fail_("รหัสผ่านเดิมไม่ถูกต้อง");
+  }
+  var pw = passwordIn_(input.new_password, "รหัสผ่านใหม่");
+  var pf = passwordFields_(pw);
+  update_("users", u, { salt: pf.salt, password_hash: pf.password_hash, updated_at: nowParts_().datetime });
+  cache_().remove(SESSION_PREFIX + REQ_.user.token);
+  audit_("account", "change_password", "เปลี่ยนรหัสผ่านของตนเอง (ออกจากระบบทุกเครื่องอื่น)", u.username);
+  return { token: newSession_(u), user: publicUser_(u), message: "เปลี่ยนรหัสผ่านแล้ว" };
+}
+
+// Admin: create {username, fullname, role, password[, active]} or update {id, fullname, role, active}.
+function actionUserSave_(input) {
+  var id = phpInt_(input.id);
+  var fullname = textIn_(input, "fullname", MAX_PERSON, "ชื่อ-นามสกุล");
+  if (fullname === "") fail_("กรุณากรอกชื่อ-นามสกุล");
+  var role = input.role === undefined || input.role === null || input.role === "" ? null : safeStr_(input.role);
+  if (role !== null && ROLES.indexOf(role) === -1) fail_("บทบาทไม่ถูกต้อง (admin / user)");
+  var active = input.active === undefined || input.active === null || input.active === "" ? null
+    : (input.active === true || input.active === 1 || input.active === "1" || input.active === "true" ? 1 : 0);
+  var now = nowParts_().datetime;
+
+  if (id) {
+    var u = liveUser_(id);
+    var ch = {};
+    var parts = [];
+    if (fullname !== u.fullname) { ch.fullname = fullname; parts.push('ชื่อ "' + u.fullname + '" → "' + fullname + '"'); }
+    if (role !== null && role !== u.role) { ch.role = role; parts.push("บทบาท " + roleName_(u.role) + " → " + roleName_(role)); }
+    if (active !== null && active !== u.active) { ch.active = active; parts.push("สถานะ " + activeName_(u.active) + " → " + activeName_(active)); }
+    if (!parts.length) return { changed: false, message: "ไม่มีการเปลี่ยนแปลง" };
+    assertAdminRemains_(u, ch.role || u.role, ch.active === undefined ? u.active : ch.active);
+    ch.updated_at = now;
+    update_("users", u, ch);
+    audit_("account", "user_update", "แก้ไขบัญชี " + u.username + ": " + parts.join("; ") +
+      (ch.active === 0 ? " (ออกจากระบบทุกเครื่อง)" : ""), u.username);
+    return { changed: true, user: publicUser_(u), message: "บันทึกบัญชี " + u.username + " แล้ว" };
+  }
+
+  var username = phpTrim_(safeStr_(input.username)).toLowerCase();
+  if (!USERNAME_RE.test(username)) fail_("ชื่อผู้ใช้ต้องยาว 3-30 ตัว ใช้ได้เฉพาะ a-z 0-9 . _ -");
+  if (findUserByName_(username)) fail_("ชื่อผู้ใช้ \"" + username + "\" มีอยู่แล้ว");
+  var pw = passwordIn_(input.password, "รหัสผ่าน");
+  var pf = passwordFields_(pw);
+  var nu = insert_("users", {
+    username: username, password_hash: pf.password_hash, salt: pf.salt, fullname: fullname,
+    role: role || "user", active: active === null ? 1 : active, created_at: now, updated_at: null, last_login: null
+  });
+  audit_("account", "user_create", "สร้างบัญชี " + username + " (" + fullname + ") บทบาท " + roleName_(nu.role) +
+    (nu.active === 1 ? "" : " · ปิดใช้งาน"), username);
+  return { changed: true, user: publicUser_(nu), message: "สร้างบัญชี " + username + " แล้ว" };
+}
+
+// Admin: set a new password for a user (ends that user's sessions, lifts a login lockout).
+function actionUserResetPassword_(input) {
+  var u = liveUser_(input.id);
+  var pw = passwordIn_(input.password, "รหัสผ่านใหม่");
+  var pf = passwordFields_(pw);
+  update_("users", u, { salt: pf.salt, password_hash: pf.password_hash, updated_at: nowParts_().datetime });
+  cache_().remove(loginFailKey_(u.username));
+  audit_("account", "user_reset_password", "ตั้งรหัสผ่านใหม่ให้บัญชี " + u.username + " (ออกจากระบบทุกเครื่อง)", u.username);
+  var out = { message: "ตั้งรหัสผ่านใหม่ให้ " + u.username + " แล้ว" };
+  if (u.id === REQ_.user.id) { // own account: keep this browser logged in
+    cache_().remove(SESSION_PREFIX + REQ_.user.token);
+    out.token = newSession_(u);
+  }
+  return out;
+}
+
+// Admin: enable / disable a user (disabling ends that user's sessions).
+function actionUserToggle_(input) {
+  var u = liveUser_(input.id);
+  var active = u.active === 1 ? 0 : 1;
+  if (!active) assertAdminRemains_(u, u.role, 0);
+  update_("users", u, { active: active, updated_at: nowParts_().datetime });
+  audit_("account", "user_toggle", (active ? "เปิดใช้งานบัญชี " : "ปิดใช้งานบัญชี ") + u.username +
+    (active ? "" : " (ออกจากระบบทุกเครื่อง)"), u.username);
+  return { user: publicUser_(u), message: (active ? "เปิดใช้งาน " : "ปิดใช้งาน ") + u.username + " แล้ว" };
+}
+
 /* ===================== router ===================== */
 
 function handleRead_(action, p) {
@@ -269,6 +640,8 @@ function handleRead_(action, p) {
     case "export": return exportHistory_(queryHistory_(p));
     case "logs": return { items: queryLogs_(p) };
     case "logs_export": return exportLogs_(queryLogs_(p));
+    case "me": return actionMe_();
+    case "users": return actionUsers_();
   }
   fail_("Unknown action");
 }
@@ -289,6 +662,11 @@ function handleWrite_(action, input) {
     case "movement_delete": return actionMovementDelete_(input);
     case "repair_update": return actionRepairUpdate_(input);
     case "repair_delete": return actionRepairDelete_(input);
+    case "logout": return actionLogout_();
+    case "change_password": return actionChangePassword_(input);
+    case "user_save": return actionUserSave_(input);
+    case "user_reset_password": return actionUserResetPassword_(input);
+    case "user_toggle": return actionUserToggle_(input);
   }
   fail_("Unknown action");
 }
@@ -440,7 +818,7 @@ function queryHistory_(p) {
     if (type !== null && m.type_id !== type) return false;
     if (act !== null && !eqCi_(m.action, act)) return false;
     if (dept !== null && !eqCi_(m.department, dept)) return false;
-    if (q && !(q(m.doc_no) || q(m.person) || q(m.note))) return false;
+    if (q && !(q(m.doc_no) || q(m.person) || q(m.note) || q(m.actor) || q(m.username))) return false;
     return true;
   });
   var tickets = null;
@@ -460,10 +838,11 @@ function queryHistory_(p) {
 }
 
 function exportHistory_(items) {
-  var lines = [csvLine_(["เลขที่เอกสาร", "วันที่", "เวลา", "รายการ", "รหัส", "ประเภท", "ขนาด", "จำนวน", "ฝ่าย", "ผู้ทำรายการ", "หมายเหตุ"])];
+  var lines = [csvLine_(["เลขที่เอกสาร", "วันที่", "เวลา", "รายการ", "รหัส", "ประเภท", "ขนาด", "จำนวน", "ฝ่าย",
+    "ผู้ทำรายการ (บัญชี)", "ชื่อผู้ใช้", "ชื่อที่ระบุ", "หมายเหตุ"])];
   items.forEach(function (r) {
     lines.push(csvLine_([r.doc_no, r.moved_at.slice(0, 10), r.moved_at.slice(11, 16), ACT_NAME[r.action] || r.action,
-      r.code, r.type_name, r.size, r.qty, r.department, r.person, r.note]));
+      r.code, r.type_name, r.size, r.qty, r.department, r.actor, r.username, r.person, r.note]));
   });
   return { filename: "pallet_history_" + stamp_() + ".csv", csv: lines.join("") };
 }
@@ -477,16 +856,16 @@ function queryLogs_(p) {
     if (from !== null && !(l.created_at >= from)) return false;
     if (to !== null && !(l.created_at <= to)) return false;
     if (cat !== null && !eqCi_(l.category, cat)) return false;
-    if (q && !(q(l.detail) || q(l.ref) || q(l.actor))) return false;
+    if (q && !(q(l.detail) || q(l.ref) || q(l.actor) || q(l.username))) return false;
     return true;
   }).sort(function (a, b) { return b.id - a.id; }).slice(0, 3000).map(plain_);
 }
 
 function exportLogs_(items) {
-  var lines = [csvLine_(["ลำดับ", "วันที่", "เวลา", "หมวด", "เลขที่อ้างอิง", "รายละเอียด", "ผู้ทำรายการ", "IP"])];
+  var lines = [csvLine_(["ลำดับ", "วันที่", "เวลา", "หมวด", "เลขที่อ้างอิง", "รายละเอียด", "ผู้ทำรายการ", "ชื่อผู้ใช้", "IP"])];
   items.forEach(function (r) {
     lines.push(csvLine_([r.id, r.created_at.slice(0, 10), r.created_at.slice(11, 19), LOG_CAT_NAME[r.category] || r.category,
-      r.ref, r.detail, r.actor, r.ip]));
+      r.ref, r.detail, r.actor, r.username, r.ip]));
   });
   return { filename: "pallet_log_" + stamp_() + ".csv", csv: lines.join("") };
 }
@@ -561,9 +940,9 @@ function actionRepairStart_(input) {
   if (rp.stage !== "damaged") fail_("ใบนี้ไม่ได้อยู่สถานะชำรุด");
   var at = moment_(input);
   var person = textIn_(input, "person", MAX_PERSON, "ชื่อผู้ทำรายการ");
-  update_("repairs", rp, { stage: "repairing", started_at: at, repairer: person });
+  update_("repairs", rp, stampTicket_({ stage: "repairing", started_at: at, repairer: phpTruthy_(person) ? person : actorName_() }));
   var r = move_("repair_start", rp.type_id, rp.size, rp.qty, "damaged", "repairing",
-    { person: person, note: rp.ticket_no, repair_id: rp.id, moved_at: at });
+    { person: rp.repairer, note: rp.ticket_no, repair_id: rp.id, moved_at: at });
   r.message = "ส่งซ่อม " + rp.ticket_no + " แล้ว";
   return r;
 }
@@ -575,11 +954,11 @@ function actionRepairDone_(input) {
   var rawNote = safeStr_(input.note);
   if (mbLen_(rawNote) > MAX_REPAIR_NOTE) fail_("หมายเหตุยาวเกิน " + MAX_REPAIR_NOTE + " ตัวอักษร");
   var person = textIn_(input, "person", MAX_PERSON, "ชื่อผู้ทำรายการ");
-  update_("repairs", rp, {
+  update_("repairs", rp, stampTicket_({
     stage: "done",
     finished_at: at,
     note: (rp.note == null ? "" : rp.note) + (phpTruthy_(rawNote) ? "\nซ่อมเสร็จ: " + rawNote : "")
-  });
+  }));
   var r = move_("repair_done", rp.type_id, rp.size, rp.qty, "repairing", "available",
     { person: phpTruthy_(person) ? person : rp.repairer, note: rp.ticket_no, repair_id: rp.id, moved_at: at });
   r.message = "ซ่อมเสร็จ " + rp.qty + " ตัว กลับเข้าคลังพร้อมใช้";
@@ -593,7 +972,7 @@ function actionScrap_(input) {
   var person = textIn_(input, "person", MAX_PERSON, "ชื่อผู้ทำรายการ");
   var note = textIn_(input, "note", MAX_TEXT, "หมายเหตุ");
   var fromStage = rp.stage;
-  update_("repairs", rp, { stage: "scrapped", finished_at: at });
+  update_("repairs", rp, stampTicket_({ stage: "scrapped", finished_at: at }));
   var r = move_("scrap", rp.type_id, rp.size, rp.qty, fromStage, "scrapped",
     { person: person, note: rp.ticket_no + " " + note, repair_id: rp.id, moved_at: at });
   r.message = "ตัดจำหน่าย " + rp.qty + " ตัว แล้ว";
@@ -749,6 +1128,7 @@ function actionMovementUpdate_(input) {
     pRepairs.forEach(function (r) { if (r.id === m.repair_id) ticket = r; });
     if (ticket) {
       syncTicket_(ticket, chain);
+      stampTicket_(ticket);
       if (ch.qty !== undefined) {
         chainNote = " · ปรับจำนวนทั้งชุดงานซ่อม " + ticket.ticket_no + " (" + chain.length + " รายการ + ใบแจ้งซ่อม)";
       }
@@ -759,7 +1139,7 @@ function actionMovementUpdate_(input) {
   checkChains_(pMoves, pRepairs, touched, verb);
 
   // before -> after text (built before the live row m is updated)
-  var labels = { qty: "จำนวน", moved_at: "วันที่/เวลา", department: "ฝ่าย", person: "ผู้ทำรายการ", note: "หมายเหตุ" };
+  var labels = { qty: "จำนวน", moved_at: "วันที่/เวลา", department: "ฝ่าย", person: "ชื่อที่ระบุ", note: "หมายเหตุ" };
   var parts = Object.keys(labels).filter(function (k) { return ch[k] !== undefined; }).map(function (k) {
     if (k === "qty") return labels[k] + " " + m.qty + " → " + ch.qty;
     if (k === "moved_at") return labels[k] + " " + dtTh_(m.moved_at) + " → " + dtTh_(ch.moved_at);
@@ -772,7 +1152,7 @@ function actionMovementUpdate_(input) {
 
   audit_("pallet", "แก้ไขรายการ",
     "แก้ไขรายการ " + m.doc_no + " (" + ACT_NAME[m.action] + " " + str_(t.code) + " ขนาด " + m.size + "): " +
-    parts.join("; ") + chainNote, m.doc_no, "");
+    parts.join("; ") + chainNote, m.doc_no);
   return { changed: true, message: "แก้ไขรายการ " + m.doc_no + " แล้ว" };
 }
 
@@ -785,7 +1165,7 @@ function actionMovementDelete_(input) {
   validateLedger_(moves, proposed, "ลบไม่ได้");
   var desc = describeMove_(m);
   delete_("movements", m);
-  audit_("pallet", "ลบรายการ", "ลบรายการ " + m.doc_no + ": " + desc, m.doc_no, "");
+  audit_("pallet", "ลบรายการ", "ลบรายการ " + m.doc_no + ": " + desc, m.doc_no);
   return { removed: { movements: 1, repairs: 0 }, message: "ลบรายการ " + m.doc_no + " แล้ว" };
 }
 
@@ -801,9 +1181,13 @@ function actionRepairUpdate_(input) {
       fail_("แก้ไขจำนวน/สถานะ/ประเภท/ฝ่ายของใบแจ้งซ่อมไม่ได้ — แก้ได้ที่รายการแจ้งชำรุดในหน้าประวัติเคลื่อนไหว หรือลบแล้วบันทึกใหม่");
     }
   });
+  // Who opened / changed the ticket is recorded by the server from the login.
+  ["reported_by", "reported_username", "updated_by", "updated_username", "updated_at"].forEach(function (k) {
+    if (input[k] === undefined) return;
+    if (phpTrim_(safeStr_(input[k])) !== str_(rp[k])) fail_("ผู้แจ้ง / ผู้แก้ไขล่าสุด บันทึกจากบัญชีผู้ใช้โดยอัตโนมัติ แก้ไขไม่ได้");
+  });
   var fields = [
-    ["cause", MAX_TEXT, "สาเหตุการชำรุด"], ["reported_by", MAX_PERSON, "ผู้แจ้ง"],
-    ["repairer", MAX_PERSON, "ช่างผู้ซ่อม"], ["note", MAX_REPAIR_NOTE, "หมายเหตุ"]
+    ["cause", MAX_TEXT, "สาเหตุการชำรุด"], ["repairer", MAX_PERSON, "ช่างผู้ซ่อม"], ["note", MAX_REPAIR_NOTE, "หมายเหตุ"]
   ];
   var ch = {};
   var parts = [];
@@ -816,8 +1200,8 @@ function actionRepairUpdate_(input) {
     }
   });
   if (!parts.length) return { changed: false, message: "ไม่มีการเปลี่ยนแปลง" };
-  update_("repairs", rp, ch);
-  audit_("repair", "แก้ไขใบแจ้งซ่อม", "แก้ไขใบแจ้งซ่อม " + rp.ticket_no + ": " + parts.join("; "), rp.ticket_no, "");
+  update_("repairs", rp, stampTicket_(ch));
+  audit_("repair", "แก้ไขใบแจ้งซ่อม", "แก้ไขใบแจ้งซ่อม " + rp.ticket_no + ": " + parts.join("; "), rp.ticket_no);
   return { changed: true, message: "แก้ไขใบแจ้งซ่อม " + rp.ticket_no + " แล้ว" };
 }
 
@@ -839,7 +1223,7 @@ function deleteChain_(rid) {
   if (ticket) delete_("repairs", ticket);
   audit_("pallet", "ลบรายการ",
     "ลบรายการทั้งชุดงานซ่อม " + tno + " (" + str_(t.code) + " ขนาด " + str_((ticket || chain[0] || {}).size) + "): " +
-    (ticket ? "ใบแจ้งซ่อม + " : "") + chain.length + " รายการ — " + list.join(", "), tno, "");
+    (ticket ? "ใบแจ้งซ่อม + " : "") + chain.length + " รายการ — " + list.join(", "), tno);
   return {
     removed: { movements: chain.length, repairs: ticket ? 1 : 0 },
     message: "ลบงานซ่อม " + tno + " ทั้งชุดแล้ว (ใบแจ้งซ่อม + " + chain.length + " รายการเคลื่อนไหว)"
@@ -989,7 +1373,8 @@ function describeMove_(m) {
   return ACT_NAME[m.action] + " " + str_(t.code) + " (" + str_(t.name) + ") ขนาด " + m.size + " ม. จำนวน " + m.qty + " ตัว" +
     " · วันที่ " + dtTh_(m.moved_at) +
     (!phpEmpty_(m.department) ? " · ฝ่าย: " + m.department : "") +
-    (!phpEmpty_(m.person) ? " · ผู้ทำรายการ: " + m.person : "") +
+    (!phpEmpty_(m.actor) ? " · บันทึกโดย: " + m.actor : "") +
+    (!phpEmpty_(m.person) ? " · ชื่อที่ระบุ: " + m.person : "") +
     (!phpEmpty_(m.note) ? " · " + m.note : "");
 }
 
@@ -1114,16 +1499,19 @@ function move_(action, type, size, qty, from, to, extra) {
     note: extra.note == null ? "" : extra.note,
     repair_id: extra.repair_id == null ? null : extra.repair_id,
     moved_at: movedAt,
-    created_at: nowParts_().datetime
+    created_at: nowParts_().datetime,
+    actor: REQ_.actor,
+    username: REQ_.username
   });
   var t = getType_(type);
   var detail = ACT_NAME[action] + " " + t.code + " (" + t.name + ") ขนาด " + size + " ม. จำนวน " + qty + " ตัว" +
     " [" + (from ? STATUS_NAME[from] : "ภายนอก") + " → " + STATUS_NAME[to] + "]" +
     (!phpEmpty_(extra.department) ? " ฝ่าย: " + extra.department : "") +
     " · เวลาทำรายการ " + movedAt.slice(8, 10) + "/" + movedAt.slice(5, 7) + "/" + movedAt.slice(0, 4) + " " + movedAt.slice(11, 16) +
+    (!phpEmpty_(extra.person) ? " · ชื่อที่ระบุ: " + extra.person : "") +
     (!phpEmpty_(extra.note) ? " · " + extra.note : "");
   var cat = ["damage", "repair_start", "repair_done", "scrap"].indexOf(action) !== -1 ? "repair" : "pallet";
-  audit_(cat, action, detail, doc, phpTrim_(extra.person == null ? "" : extra.person));
+  audit_(cat, action, detail, doc);
   return { doc_no: doc, id: row.id };
 }
 
@@ -1131,18 +1519,35 @@ function createTicket_(type, size, qty, source, dept, input, at) {
   var row = insert_("repairs", {
     ticket_no: nextNo_("RPR", "repairs", "ticket_no"),
     type_id: type, size: size, qty: qty, stage: "damaged", source: source,
-    department: dept, cause: phpTrim_(safeStr_(input.cause)), reported_by: phpTrim_(safeStr_(input.person)),
-    repairer: "", reported_at: at, started_at: null, finished_at: null, note: phpTrim_(safeStr_(input.note))
+    department: dept, cause: phpTrim_(safeStr_(input.cause)), reported_by: REQ_.actor, reported_username: REQ_.username,
+    repairer: "", reported_at: at, started_at: null, finished_at: null, note: phpTrim_(safeStr_(input.note)),
+    updated_by: "", updated_username: "", updated_at: null
   });
   return row.id;
 }
 
-function audit_(category, action, detail, ref, actor) {
-  actor = actor == null ? "" : actor;
+// Adds "last changed by" (the logged-in user) to a ticket change set / row.
+function stampTicket_(obj) {
+  obj.updated_by = REQ_.actor;
+  obj.updated_username = REQ_.username;
+  obj.updated_at = nowParts_().datetime;
+  return obj;
+}
+
+// Display name of the logged-in user (fullname, or username when empty).
+function actorName_() {
+  var u = REQ_.user;
+  return u ? (phpEmpty_(u.fullname) ? u.username : u.fullname) : "";
+}
+
+// The actor is ALWAYS the logged-in user of this request (set by authenticate_),
+// never a name sent by the client.
+function audit_(category, action, detail, ref) {
   insert_("audit_logs", {
     category: category, action: action, ref: ref || "",
     detail: mbSubstr_(detail, 0, 500),
-    actor: actor !== "" ? actor : REQ_.actor,
+    actor: REQ_.actor || "",
+    username: REQ_.username || "",
     ip: "web", // GAS cannot see the client IP
     created_at: nowParts_().datetime
   });
@@ -1158,8 +1563,10 @@ function textIn_(input, key, max, label) {
 
 var REQ_ = null; // per-request state: spreadsheet, loaded tables, pending writes
 
-function resetRequest_(actor) {
-  REQ_ = { ss: null, tables: {}, appends: {}, updates: [], deletes: [], actor: actor || "" };
+// user: the authenticated user ({id, username, fullname, ...}) or null.
+function resetRequest_(user) {
+  REQ_ = { ss: null, tables: {}, appends: {}, updates: [], deletes: [], user: null, actor: "", username: "" };
+  if (user) setUser_(user);
 }
 
 function db_() {
@@ -1172,16 +1579,24 @@ function db_() {
 }
 
 // Reads the whole sheet once per request and converts rows to typed objects.
+// Sheets in AUTO_CREATE_TABLES are created when missing, and columns added to
+// SCHEMA after a sheet was created are appended to its header row (existing
+// rows read them as empty), so an older live spreadsheet upgrades itself.
 function table_(name) {
   if (REQ_.tables[name]) return REQ_.tables[name];
   var sheet = db_().getSheetByName(name);
+  if (!sheet && AUTO_CREATE_TABLES.indexOf(name) !== -1) sheet = prepareSheet_(db_(), name, null);
   if (!sheet) throw new Error('ไม่พบชีต "' + name + '" กรุณารัน setupSystem() อีกครั้ง');
   var values = sheet.getDataRange().getValues();
   var header = (values[0] || []).map(function (h) { return String(h).trim(); });
   var cols = SCHEMA[name];
   var idx = cols.map(function (c) { return header.indexOf(c[0]); });
-  for (var c = 0; c < cols.length; c++) {
-    if (idx[c] === -1) throw new Error('หัวตารางของชีต "' + name + '" ไม่ครบ (ไม่พบคอลัมน์ ' + cols[c][0] + ") กรุณารัน setupSystem()");
+  if (idx.indexOf(-1) !== -1) {
+    if (!header.some(function (h) { return h !== ""; })) {
+      throw new Error('หัวตารางของชีต "' + name + '" ไม่ครบ กรุณารัน setupSystem()');
+    }
+    header = addMissingColumns_(sheet, name, header);
+    idx = cols.map(function (c) { return header.indexOf(c[0]); });
   }
   var rows = [];
   var maxId = 0;
@@ -1289,6 +1704,27 @@ function flush_() {
   Object.keys(byTable).forEach(function (name) { delete REQ_.tables[name]; });
 }
 
+// Appends the SCHEMA columns missing from the header row (written at once, not
+// buffered; plain-text / number format for the whole new columns). Returns the
+// new header.
+function addMissingColumns_(sheet, name, header) {
+  while (header.length && header[header.length - 1] === "") header.pop();
+  var missing = SCHEMA[name].filter(function (c) { return header.indexOf(c[0]) === -1; });
+  if (!missing.length) return header;
+  var start = header.length + 1;
+  var needCols = start + missing.length - 1;
+  var maxCols = sheet.getMaxColumns();
+  if (needCols > maxCols) sheet.insertColumnsAfter(maxCols, needCols - maxCols);
+  sheet.getRange(1, start, 1, missing.length).setValues([missing.map(function (c) { return c[0]; })]);
+  var maxRows = sheet.getMaxRows();
+  var rowFormat = missing.map(function (c) { return c[1].indexOf("int") === 0 ? "0" : "@"; });
+  var formats = [];
+  for (var r = 0; r < maxRows; r++) formats.push(rowFormat);
+  sheet.getRange(1, start, maxRows, missing.length).setNumberFormats(formats);
+  sheet.getRange(1, start, 1, missing.length).setFontWeight("bold");
+  return header.concat(missing.map(function (c) { return c[0]; }));
+}
+
 function rowValues_(name, t, row, width, base) {
   var out = base ? base.slice() : [];
   while (out.length < width) out.push("");
@@ -1358,31 +1794,17 @@ function setupSystem() {
   var defaultSheets = created ? ss.getSheets() : [];
   TABLE_ORDER.forEach(function (name, i) {
     var sheet = ss.getSheetByName(name);
-    if (!sheet) {
-      if (created && i === 0 && defaultSheets.length) {
-        sheet = defaultSheets[0];
-        sheet.setName(name);
-      } else {
-        sheet = ss.insertSheet(name);
-      }
+    if (!sheet && created && i === 0 && defaultSheets.length) {
+      sheet = defaultSheets[0];
+      sheet.setName(name);
     }
-    var cols = SCHEMA[name];
-    var headers = cols.map(function (c) { return c[0]; });
-    if (sheet.getLastRow() === 0) {
-      sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-    }
-    sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
-    sheet.setFrozenRows(1);
-    // Plain-text format for text/date columns so Sheets never converts values
-    // (e.g. "2026-10-05 08:00:00" into a Date or "=..." into a formula).
-    var maxRows = sheet.getMaxRows();
-    var formats = [];
-    var rowFormat = cols.map(function (c) { return c[1].indexOf("int") === 0 ? "0" : "@"; });
-    for (var r = 0; r < maxRows; r++) formats.push(rowFormat);
-    sheet.getRange(1, 1, maxRows, headers.length).setNumberFormats(formats);
+    prepareSheet_(ss, name, sheet);
   });
 
-  REQ_ = { ss: ss, tables: {}, appends: {}, updates: [], deletes: [], actor: "" };
+  resetRequest_(null);
+  REQ_.ss = ss;
+  // Older sheets: append columns added to SCHEMA since they were created.
+  TABLE_ORDER.forEach(function (name) { table_(name); });
   if (!table_("pallet_types").rows.length) {
     SEED_TYPES.forEach(function (t) {
       insert_("pallet_types", { tkey: t[0], code: t[1], name: t[2], short: t[3], description: t[4], color: t[5], sizes: t[6], sort: t[7] });
@@ -1400,16 +1822,40 @@ function setupSystem() {
     created: created,
     spreadsheetId: ss.getId(),
     spreadsheetUrl: ss.getUrl(),
-    passwordConfigured: Boolean(properties.getProperty(ACTION_PASSWORD_PROPERTY))
+    users: Math.max(0, ss.getSheetByName("users").getLastRow() - 1),
+    initialAdminPasswordConfigured: Boolean(properties.getProperty(INITIAL_ADMIN_PASSWORD_PROPERTY)),
+    resetPasswordConfigured: Boolean(properties.getProperty(RESET_PASSWORD_PROPERTY))
   };
   console.log(JSON.stringify(result));
   return result;
 }
 
+// Creates the sheet when missing (sheet === null), writes the header row on an
+// empty sheet, bolds/freezes it and sets plain-text formats for text/date
+// columns so Sheets never converts values (e.g. "2026-10-05 08:00:00" into a
+// Date or "=..." into a formula).
+function prepareSheet_(ss, name, sheet) {
+  if (!sheet) sheet = ss.getSheetByName(name) || ss.insertSheet(name);
+  var cols = SCHEMA[name];
+  var headers = cols.map(function (c) { return c[0]; });
+  if (sheet.getMaxColumns() < headers.length) sheet.insertColumnsAfter(sheet.getMaxColumns(), headers.length - sheet.getMaxColumns());
+  if (sheet.getLastRow() === 0) sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
+  sheet.setFrozenRows(1);
+  var maxRows = sheet.getMaxRows();
+  var formats = [];
+  var rowFormat = cols.map(function (c) { return c[1].indexOf("int") === 0 ? "0" : "@"; });
+  for (var r = 0; r < maxRows; r++) formats.push(rowFormat);
+  sheet.getRange(1, 1, maxRows, headers.length).setNumberFormats(formats);
+  return sheet;
+}
+
 /* ===================== small utilities ===================== */
 
-function fail_(message) {
-  throw new Error(message);
+function fail_(message, code) {
+  var error = new Error(message);
+  if (code) error.code = code;
+  throw error;
 }
 
 function errorMessage_(error) {
@@ -1418,6 +1864,7 @@ function errorMessage_(error) {
 
 function errorResponse_(error) {
   var body = { ok: false, error: errorMessage_(error) };
+  if (error && error.code) body.code = error.code;
   if (error && error.passwordError) body.passwordError = true;
   return jsonResponse_(body);
 }

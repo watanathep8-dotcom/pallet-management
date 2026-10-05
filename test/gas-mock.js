@@ -9,6 +9,8 @@ const vm = require("vm");
 const fs = require("fs");
 const path = require("path");
 const assert = require("assert");
+const crypto = require("crypto");
+const { Buffer } = require("buffer"); // explicit: test/pallet-dev.js evaluates this file in a bare vm context
 
 const ROOT = path.join(__dirname, "..");
 
@@ -20,6 +22,7 @@ function createGas() {
     constructor(sheet, row, col, nr, nc) {
       if (row < 1 || col < 1 || nr < 1 || nc < 1) throw new Error("Range out of bounds");
       if (row + nr - 1 > sheet.maxRows) throw new Error("Range exceeds sheet rows: " + (row + nr - 1) + " > " + sheet.maxRows);
+      if (col + nc - 1 > sheet.maxCols) throw new Error("Range exceeds sheet columns: " + (col + nc - 1) + " > " + sheet.maxCols);
       Object.assign(this, { sheet, row, col, nr, nc });
     }
     getValues() {
@@ -67,7 +70,7 @@ function createGas() {
   }
 
   class Sheet {
-    constructor(name) { this.name = name; this.data = []; this.maxRows = 1000; }
+    constructor(name) { this.name = name; this.data = []; this.maxRows = 1000; this.maxCols = 26; }
     getName() { return this.name; }
     setName(n) { this.name = n; return this; }
     getLastRow() {
@@ -79,6 +82,8 @@ function createGas() {
     getLastColumn() { return this.data.reduce((m, row) => Math.max(m, row.length), 0); }
     getMaxRows() { return this.maxRows; }
     insertRowsAfter(after, n) { this.maxRows += n; return this; }
+    getMaxColumns() { return this.maxCols; }
+    insertColumnsAfter(after, n) { this.maxCols += n; state.colInserts = (state.colInserts || 0) + 1; return this; }
     getRange(r, c, nr = 1, nc = 1) { return new Range(this, r, c, nr, nc); }
     getDataRange() { return new Range(this, 1, 1, Math.max(1, this.getLastRow()), Math.max(1, this.getLastColumn())); }
     setFrozenRows(n) { this.frozen = n; return this; }
@@ -137,7 +142,18 @@ function createGas() {
         };
       }
     },
-    Utilities: { sleep(ms) { state.sleeps += ms; } },
+    Utilities: {
+      sleep(ms) { state.sleeps += ms; },
+      DigestAlgorithm: { SHA_256: "SHA_256" },
+      Charset: { UTF_8: "UTF_8" },
+      getUuid() { return crypto.randomUUID(); },
+      // Like Apps Script: string (charset) or byte array in, signed byte array out.
+      computeDigest(alg, value) {
+        assert.strictEqual(alg, "SHA_256");
+        const buf = typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value.map(b => b & 255));
+        return Array.from(crypto.createHash("sha256").update(buf).digest(), b => (b > 127 ? b - 256 : b));
+      }
+    },
     ContentService: {
       MimeType: { JSON: "application/json", JAVASCRIPT: "application/javascript", CSV: "text/csv", TEXT: "text/plain" },
       createTextOutput(text) {
@@ -166,20 +182,31 @@ function test(name, fn) {
 
 const { gas, state } = createGas();
 const ctx = loadCode(gas);
-const get = (action, params = {}) => {
-  const out = ctx.doGet({ parameter: Object.assign({ action }, params) });
+const T = { tester: "", admin: "", editor: "" }; // session tokens
+// get/postRaw send the Tester session token unless tok is given (null = no token).
+const get = (action, params = {}, tok = T.tester) => {
+  const out = ctx.doGet({ parameter: Object.assign({ action }, tok ? { token: tok } : {}, params) });
   assert.strictEqual(out.getMimeType(), "application/json");
   return JSON.parse(out.getContent());
 };
-const postRaw = (payload) => JSON.parse(ctx.doPost({ postData: { contents: JSON.stringify(payload) } }).getContent());
-const PW = "s3cret-Pallet";
-const post = (action, body = {}) => postRaw(Object.assign({}, body, { action, password: PW, actor: "Tester" }));
+const postRaw = (payload, tok = T.tester) =>
+  JSON.parse(ctx.doPost({ postData: { contents: JSON.stringify(Object.assign(tok ? { token: tok } : {}, payload)) } }).getContent());
+const PW = "s3cret-Pallet";      // Tester's login password
+const ADMIN_PW = "init-Admin-77"; // PALLET_INITIAL_ADMIN_PASSWORD
+const EDITOR_PW = "editor-Pass-1";
+const TESTER = "Tester (tester)", EDITOR = "Editor (editor)", ADMIN = "ผู้ดูแลระบบ (admin)";
+// Writes: the client also sends a fake actor that the server must ignore.
+const post = (action, body = {}, tok = T.tester) => postRaw(Object.assign({}, body, { action, actor: "Spoofed Name" }), tok);
+const login = (username, password) => postRaw({ action: "login", username, password }, null);
 const okData = (res) => { assert.strictEqual(res.ok, true, "expected ok, got: " + JSON.stringify(res)); return res.data; };
 const err = (res, re) => {
   assert.strictEqual(res.ok, false, "expected error, got: " + JSON.stringify(res));
   if (re) assert.ok(re.test(res.error), "error '" + res.error + "' !~ " + re);
   return res;
 };
+const authErr = (res) => { err(res); assert.strictEqual(res.code, "AUTH"); assert.strictEqual(res.error, "กรุณาเข้าสู่ระบบ"); return res; };
+// Forget login / reset-password failure counters ("15 minutes later") but keep sessions.
+const clearFails = () => Object.keys(state.cache).forEach(k => { if (/FAILURES/.test(k)) delete state.cache[k]; });
 
 const bkk = new Date(Date.now() + 7 * 3600 * 1000);
 const p2 = n => String(n).padStart(2, "0");
@@ -191,25 +218,37 @@ const sheet = n => state.spreadsheets[state.props.PALLET_SPREADSHEET_ID].getShee
 const dataRows = n => sheet(n).getLastRow() - 1;
 const stockOf = (stock, type, size, st) => ((stock[type] || {})[size] || {})[st] || 0;
 const lastLog = () => okData(get("logs")).items[0];
+const userRows = () => { const d = sheet("users").data; return d.slice(1).filter(r => r.some(v => v !== "" && v != null)).map(r => Object.fromEntries(d[0].map((k, i) => [k, r[i]]))); };
+
+const ALL_READS = ["bootstrap", "dashboard", "repairs", "history", "export", "logs", "logs_export", "me", "users"];
+const ALL_POSTS = ["receive", "issue", "return", "damage", "repair_start", "repair_done", "scrap", "dept_save", "dept_delete",
+  "reset_data", "movement_update", "movement_delete", "repair_update", "repair_delete", "verifyResetPassword",
+  "logout", "change_password", "user_save", "user_reset_password", "user_toggle"];
 
 console.log("Pallet Hub GAS backend tests (today " + TODAY + " Asia/Bangkok)");
 
 /* ---------- setup ---------- */
-test("API before setup reports setupSystem error", () => {
-  err(get("bootstrap"), /setupSystem/);
+test("API before setup: login reports setupSystem error, other actions need login first", () => {
+  err(login("admin", "x"), /setupSystem/);
+  authErr(get("bootstrap", {}, null));
 });
 
-test("setupSystem creates spreadsheet, sheets, headers, seed data", () => {
+test("setupSystem creates spreadsheet, sheets (incl. users), headers, seed data", () => {
   const r = ctx.setupSystem();
   assert.strictEqual(r.created, true);
   assert.ok(state.props.PALLET_SPREADSHEET_ID);
   const ss = state.spreadsheets[state.props.PALLET_SPREADSHEET_ID];
   assert.strictEqual(ss.tz, "Asia/Bangkok");
-  assert.deepStrictEqual(ss.getSheets().map(s => s.getName()), ["pallet_types", "departments", "repairs", "movements", "audit_logs"]);
-  assert.deepStrictEqual(sheet("movements").data[0], ["id", "doc_no", "action", "type_id", "size", "qty", "from_status", "to_status", "department", "person", "note", "repair_id", "moved_at", "created_at"]);
+  assert.deepStrictEqual(ss.getSheets().map(s => s.getName()), ["pallet_types", "departments", "repairs", "movements", "audit_logs", "users"]);
+  assert.deepStrictEqual(sheet("movements").data[0], ["id", "doc_no", "action", "type_id", "size", "qty", "from_status", "to_status", "department", "person", "note", "repair_id", "moved_at", "created_at", "actor", "username"]);
+  assert.deepStrictEqual(sheet("audit_logs").data[0], ["id", "category", "action", "ref", "detail", "actor", "ip", "created_at", "username"]);
+  assert.deepStrictEqual(sheet("users").data[0], ["id", "username", "password_hash", "salt", "fullname", "role", "active", "created_at", "updated_at", "last_login"]);
+  assert.strictEqual(sheet("users").getFrozenRows(), 1);
   assert.strictEqual(dataRows("pallet_types"), 4);
   assert.strictEqual(dataRows("departments"), 8);
-  assert.strictEqual(r.passwordConfigured, false);
+  assert.strictEqual(dataRows("users"), 0);
+  assert.strictEqual(r.users, 0);
+  assert.strictEqual(r.initialAdminPasswordConfigured, false);
 });
 
 test("setupSystem is idempotent (no second spreadsheet, no duplicate seed)", () => {
@@ -220,28 +259,30 @@ test("setupSystem is idempotent (no second spreadsheet, no duplicate seed)", () 
   assert.strictEqual(state.created, 1);
   assert.strictEqual(dataRows("pallet_types"), 4);
   assert.strictEqual(dataRows("departments"), 8);
+  assert.strictEqual(sheet("movements").data[0].length, 16);
 });
 
-/* ---------- reads ---------- */
-let types;
-test("bootstrap returns types (sorted), active departments, empty stock, now", () => {
-  const d = okData(get("bootstrap"));
-  types = d.types;
-  assert.deepStrictEqual(d.types.map(t => t.tkey), ["RM", "PK", "FG", "PL"]);
-  assert.deepStrictEqual(d.types[1], { id: 2, tkey: "PK", code: "PK", name: "พาเลทสำหรับใส่ PK", short: "ผลิตภัณฑ์ (PK)", description: "ขวด + ฝา + แกลลอน ฯ", color: "#F5B400", sizes: "1.1x1.1,1.2x1.2", sort: 2 });
-  assert.strictEqual(d.departments.length, 8);
-  assert.deepStrictEqual(d.departments[0], { id: 1, name: "ฝ่ายผลิต", icon: "fa-industry", color: "#E2231A", active: 1 });
-  assert.deepStrictEqual(d.stock, {});
-  assert.deepStrictEqual(d.dept, []);
-  assert.strictEqual(d.now.date, TODAY);
-  assert.ok(/^\d{2}:\d{2}$/.test(d.now.time));
+/* ---------- authentication ---------- */
+test("every action refuses without a token / with an unknown or malformed token (code AUTH), nothing written", () => {
+  const before = JSON.stringify(state.spreadsheets[state.props.PALLET_SPREADSHEET_ID].sheets.map(s => s.data));
+  const bad = ["", "abc", "f".repeat(64), "<script>", "F".repeat(64)];
+  for (const a of ALL_READS) {
+    authErr(get(a, {}, null));
+    for (const t of bad) authErr(get(a, { token: t }, null));
+    authErr(postRaw({ action: a }, null));
+  }
+  for (const a of ALL_POSTS) {
+    authErr(postRaw({ action: a, resetPassword: "x", type_id: 1, size: "1.2x1.2", qty: 1, name: "X", id: 1 }, null));
+    for (const t of bad) authErr(postRaw({ action: a, token: t }, null));
+  }
+  assert.strictEqual(JSON.stringify(state.spreadsheets[state.props.PALLET_SPREADSHEET_ID].sheets.map(s => s.data)), before);
 });
 
-test("unknown action / write action via GET are rejected", () => {
+test("unknown action / POST-only action via GET are rejected", () => {
   err(get("nope"), /^Unknown action$/);
-  err(postRaw({ action: "nope", password: PW }), /^Unknown action$/);
-  err(get("receive"), /POST/);
-  err(get("verifyPassword"), /POST/);
+  err(postRaw({ action: "nope" }), /^Unknown action$/);
+  for (const a of ["receive", "login", "reset_data", "user_save", "logout", "verifyResetPassword"]) err(get(a), /POST/);
+  err(get("verifyPassword"), /^Unknown action$/); // the old shared-password check is gone
   assert.strictEqual(okData(get(undefined)).service, "Pallet Hub API");
 });
 
@@ -250,54 +291,148 @@ test("invalid JSON body is rejected", () => {
   err(r, /JSON/);
 });
 
-/* ---------- password ---------- */
-test("writes refused while PALLET_ACTION_PASSWORD is unset (Thai admin message)", () => {
-  const r = err(post("receive", Object.assign({ type_id: 1, size: "1.2x1.2", qty: 5 }, AT)), /PALLET_ACTION_PASSWORD/);
-  assert.strictEqual(r.passwordError, true);
-  err(postRaw({ action: "verifyPassword", password: "x" }), /ยังไม่ได้ตั้งรหัสผ่าน/);
-  assert.strictEqual(dataRows("movements"), 0);
+test("initial admin: refused with a Thai message while PALLET_INITIAL_ADMIN_PASSWORD is unset", () => {
+  const r = err(login("admin", "anything"), /PALLET_INITIAL_ADMIN_PASSWORD/);
+  assert.ok(/ยังไม่มีบัญชีผู้ใช้/.test(r.error));
+  assert.strictEqual(dataRows("users"), 0);
+  err(login("", ""), /กรุณากรอกชื่อผู้ใช้และรหัสผ่าน/);
 });
 
-test("verifyPassword: wrong -> error + 1s sleep, right -> valid", () => {
-  state.props.PALLET_ACTION_PASSWORD = PW;
-  const before = state.sleeps;
-  const r = err(postRaw({ action: "verifyPassword", password: "wrong" }), /รหัสไม่ถูกต้อง/);
-  assert.strictEqual(r.passwordError, true);
-  assert.strictEqual(state.sleeps - before, 1000);
-  assert.deepStrictEqual(okData(postRaw({ action: "verifyPassword", password: PW })), { valid: true });
-  err(postRaw({ action: "verifyPassword" }), /รหัสไม่ถูกต้อง/);
+test("initial admin: wrong password or another username creates nothing, costs 1 s and is logged", () => {
+  state.props.PALLET_INITIAL_ADMIN_PASSWORD = ADMIN_PW;
+  const sleeps = state.sleeps;
+  const r = err(login("admin", "wrong"), /^ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง$/);
+  assert.strictEqual(r.code, "LOGIN_FAILED");
+  assert.strictEqual(state.sleeps - sleeps, 1000);
+  err(login("root", ADMIN_PW), /^ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง$/); // only "admin" can be bootstrapped
+  assert.strictEqual(dataRows("users"), 0);
+  const logs = sheet("audit_logs").data.slice(1);
+  assert.strictEqual(logs.length, 2);
+  const h = sheet("audit_logs").data[0];
+  const row = Object.fromEntries(h.map((k, i) => [k, logs[0][i]]));
+  assert.strictEqual(row.category, "account");
+  assert.strictEqual(row.action, "login_failed");
+  assert.strictEqual(row.username, "admin");
+  assert.strictEqual(row.actor, "");
+  assert.ok(!JSON.stringify(sheet("audit_logs").data).includes("wrong")); // passwords never logged
+  clearFails();
 });
 
-test("write with wrong/missing password is refused and NOT logged", () => {
-  const logsBefore = dataRows("audit_logs");
-  err(postRaw(Object.assign({ action: "receive", password: "bad", type_id: 1, size: "1.2x1.2", qty: 5 }, AT)), /รหัสไม่ถูกต้อง/);
-  err(postRaw(Object.assign({ action: "dept_save", name: "X" })), /รหัสไม่ถูกต้อง/);
-  assert.strictEqual(dataRows("movements"), 0);
-  assert.strictEqual(dataRows("audit_logs"), logsBefore);
-  state.cache = {}; // reset failure counter for the rest of the tests
+test("initial admin: right property password creates the admin (hashed) and logs in", () => {
+  const d = okData(login(" Admin ", ADMIN_PW));
+  assert.ok(/^[a-f0-9]{64}$/.test(d.token));
+  assert.strictEqual(d.expires_in, 21600);
+  assert.strictEqual(d.initial, true);
+  assert.deepStrictEqual([d.user.username, d.user.fullname, d.user.role, d.user.active], ["admin", "ผู้ดูแลระบบ", "admin", true]);
+  assert.ok(!("password_hash" in d.user) && !("salt" in d.user));
+  T.admin = d.token;
+  const u = userRows();
+  assert.strictEqual(u.length, 1);
+  assert.strictEqual(u[0].role, "admin");
+  assert.strictEqual(u[0].active, 1);
+  assert.ok(/^[a-f0-9]{64}$/.test(u[0].password_hash) && /^[a-f0-9]{32}$/.test(u[0].salt));
+  assert.ok(!JSON.stringify(sheet("users").data).includes(ADMIN_PW));
+  assert.strictEqual(state.cache["PALLET_SESSION_" + d.token] !== undefined, true);
+  const me = okData(get("me", {}, T.admin)).user;
+  assert.strictEqual(me.username, "admin");
+  const logs = okData(get("logs", { cat: "account" }, T.admin)).items;
+  assert.deepStrictEqual(logs.slice(0, 2).map(l => [l.action, l.actor, l.username]), [["login", ADMIN, "admin"], ["user_create", ADMIN, "admin"]]);
+  // a second "initial" login does not create another admin
+  T.admin2 = okData(login("admin", ADMIN_PW)).token;
+  assert.strictEqual(dataRows("users"), 1);
+});
+
+test("admin creates accounts; username/password/role validation; usernames unique case-insensitively", () => {
+  const save = b => post("user_save", b, T.admin);
+  err(save({ username: "ab", fullname: "X", password: "12345678" }), /3-30/);
+  err(save({ username: "bad name", fullname: "X", password: "12345678" }), /3-30/);
+  err(save({ username: "x".repeat(31), fullname: "X", password: "12345678" }), /3-30/);
+  err(save({ username: "ok.user", fullname: "X", password: "1234567" }), /อย่างน้อย 8/);
+  err(save({ username: "ok.user", fullname: "  ", password: "12345678" }), /ชื่อ-นามสกุล/);
+  err(save({ username: "ok.user", fullname: "X", password: "12345678", role: "root" }), /บทบาท/);
+  err(save({ username: "ADMIN", fullname: "X", password: "12345678" }), /มีอยู่แล้ว/);
+  const d = okData(save({ username: "Tester", fullname: "Tester", password: PW }));
+  assert.deepStrictEqual([d.user.username, d.user.role, d.user.active], ["tester", "user", true]);
+  okData(save({ username: "editor", fullname: "Editor", password: EDITOR_PW }));
+  err(save({ username: "TESTER", fullname: "Dup", password: "12345678" }), /มีอยู่แล้ว/);
+  const list = okData(get("users", {}, T.admin));
+  assert.deepStrictEqual(list.users.map(u => u.username), ["admin", "tester", "editor"]);
+  assert.ok(list.users.every(u => !("password_hash" in u) && !("salt" in u)));
+  const created = okData(get("logs", { cat: "account" }, T.admin)).items.filter(l => l.action === "user_create");
+  assert.ok(created.some(l => l.ref === "tester" && l.actor === ADMIN && l.detail.includes("tester (Tester)")));
+});
+
+test("login: right password returns token + user, updates last_login, logged in audit", () => {
+  const d = okData(login("TESTER", PW));
+  T.tester = d.token;
+  assert.deepStrictEqual(Object.keys(d.user).sort(), ["active", "created_at", "fullname", "id", "last_login", "role", "updated_at", "username"]);
+  assert.strictEqual(d.user.username, "tester");
+  assert.strictEqual(d.initial, false);
+  assert.strictEqual(userRows().find(u => u.username === "tester").last_login.slice(0, 10), TODAY);
+  T.editor = okData(login("editor", EDITOR_PW)).token;
+  assert.notStrictEqual(T.tester, T.editor);
+  assert.strictEqual(okData(get("me")).user.fullname, "Tester");
+  const l = okData(get("logs", { cat: "account" }, T.admin)).items[0];
+  assert.deepStrictEqual([l.action, l.actor, l.username], ["login", EDITOR, "editor"]);
+});
+
+test("login: wrong password refused (1 s), audit row; 10 failures lock the username for 15 min", () => {
+  const sleeps = state.sleeps;
+  err(login("editor", "nope"), /^ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง$/);
+  assert.strictEqual(state.sleeps - sleeps, 1000);
+  err(login("nobody", "nope"), /^ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง$/); // unknown user: same message
+  const l = okData(get("logs", { cat: "account" }, T.admin)).items[0];
+  assert.deepStrictEqual([l.action, l.username], ["login_failed", "nobody"]);
+  state.cachePuts = [];
+  for (let i = 1; i < 10; i++) err(login("Editor", "guess" + i), /ไม่ถูกต้อง/);
+  assert.ok(state.cachePuts.every(t => t === 900));
+  const r = err(login("editor", EDITOR_PW), /ระงับชั่วคราว 15 นาที/);
+  assert.strictEqual(r.code, "LOCKED");
+  okData(login("tester", PW)); // other usernames are not affected
+  assert.ok(okData(get("logs", { cat: "account", q: "ระงับ" }, T.admin)).items.length >= 1);
+  okData(get("bootstrap", {}, T.editor)); // existing sessions keep working
+  clearFails(); // 15 minutes later
+  okData(login("editor", EDITOR_PW));
+});
+
+test("normal users cannot call admin actions (FORBIDDEN), nothing changes", () => {
+  const before = JSON.stringify(sheet("users").data);
+  for (const [a, b] of [["users", {}], ["user_save", { username: "evil", fullname: "E", password: "12345678", role: "admin" }],
+    ["user_save", { id: 2, fullname: "T", role: "admin" }], ["user_reset_password", { id: 1, password: "12345678" }], ["user_toggle", { id: 1 }]]) {
+    const r = err(post(a, b), /เฉพาะผู้ดูแลระบบ/);
+    assert.strictEqual(r.code, "FORBIDDEN");
+  }
+  const r = err(get("users"), /เฉพาะผู้ดูแลระบบ/);
+  assert.strictEqual(r.code, "FORBIDDEN");
+  assert.strictEqual(JSON.stringify(sheet("users").data), before);
 });
 
 /* ---------- receive ---------- */
-test("receive: creates RC doc, stock available, audit log with actor/ip", () => {
-  const d = okData(post("receive", Object.assign({ type_id: 1, size: "1.2x1.2", qty: 50, person: "  สมชาย ใจดี  ", note: "PO-123" }, AT)));
+test("receive: creates RC doc, stock available, server records the logged-in user (client actor ignored)", () => {
+  const d = okData(post("receive", Object.assign({ type_id: 1, size: "1.2x1.2", qty: 50, person: "  สมชาย ใจดี  ", note: "PO-123", username: "admin" }, AT)));
   assert.strictEqual(d.doc_no, "RC-" + YMD + "-0001");
   assert.strictEqual(d.id, 1);
   assert.strictEqual(d.message, "รับเข้า 50 ตัว เรียบร้อย");
   const b = okData(get("bootstrap"));
   assert.strictEqual(stockOf(b.stock, 1, "1.2x1.2", "available"), 50);
+  const m = okData(get("history", { q: d.doc_no })).items[0];
+  assert.deepStrictEqual([m.actor, m.username, m.person], [TESTER, "tester", "สมชาย ใจดี"]);
   const log = lastLog();
   assert.strictEqual(log.category, "pallet");
   assert.strictEqual(log.action, "receive");
   assert.strictEqual(log.ref, d.doc_no);
-  assert.strictEqual(log.actor, "สมชาย ใจดี");
+  assert.strictEqual(log.actor, TESTER);
+  assert.strictEqual(log.username, "tester");
   assert.strictEqual(log.ip, "web");
-  assert.strictEqual(log.detail, `รับเข้า RM (พาเลทสำหรับใส่ RM) ขนาด 1.2x1.2 ม. จำนวน 50 ตัว [ภายนอก → พร้อมใช้] · เวลาทำรายการ ${TODAY.slice(8, 10)}/${TODAY.slice(5, 7)}/${TODAY.slice(0, 4)} ${HOUR}:00 · PO-123`);
+  assert.strictEqual(log.detail, `รับเข้า RM (พาเลทสำหรับใส่ RM) ขนาด 1.2x1.2 ม. จำนวน 50 ตัว [ภายนอก → พร้อมใช้] · เวลาทำรายการ ${TODAY.slice(8, 10)}/${TODAY.slice(5, 7)}/${TODAY.slice(0, 4)} ${HOUR}:00 · ชื่อที่ระบุ: สมชาย ใจดี · PO-123`);
 });
 
-test("receive: second doc number increments; actor falls back to header actor", () => {
+test("receive: second doc number increments; actor is the session user even without a person", () => {
   const d = okData(post("receive", Object.assign({ type_id: 2, size: "1.1x1.1", qty: "30", person: "" }, AT)));
   assert.strictEqual(d.doc_no, "RC-" + YMD + "-0002");
-  assert.strictEqual(lastLog().actor, "Tester");
+  assert.strictEqual(lastLog().actor, TESTER);
+  assert.ok(!JSON.stringify(sheet("movements").data).includes("Spoofed"));
+  assert.ok(!JSON.stringify(sheet("audit_logs").data).includes("Spoofed"));
 });
 
 test("receive: validation errors are rejected and logged as warn", () => {
@@ -372,7 +507,8 @@ test("return damaged: opens repair ticket, issued -> damaged, DM doc", () => {
   assert.strictEqual(ticket1.source, "issued");
   assert.strictEqual(ticket1.department, "ฝ่ายผลิต");
   assert.strictEqual(ticket1.cause, "ไม้หัก");
-  assert.strictEqual(ticket1.reported_by, "B");
+  assert.strictEqual(ticket1.reported_by, TESTER); // the logged-in user, not the typed person "B"
+  assert.strictEqual(ticket1.reported_username, "tester");
   assert.strictEqual(ticket1.note, "n1");
   assert.strictEqual(ticket1.started_at, null);
   assert.strictEqual(ticket1.finished_at, null);
@@ -426,6 +562,8 @@ test("repair_start: damaged -> repairing (repairer, started_at), cannot start tw
   assert.strictEqual(t.stage, "repairing");
   assert.strictEqual(t.repairer, "ช่างหนึ่ง");
   assert.strictEqual(t.started_at, `${TODAY} ${HOUR}:00:00`);
+  assert.deepStrictEqual([t.updated_by, t.updated_username], [TESTER, "tester"]);
+  assert.strictEqual(okData(get("history", { q: d.doc_no })).items[0].actor, TESTER);
   err(post("repair_start", Object.assign({ id: ticket1.id }, AT)), /^ใบนี้ไม่ได้อยู่สถานะชำรุด$/);
   const b = okData(get("bootstrap"));
   assert.strictEqual(stockOf(b.stock, 1, "1.2x1.2", "damaged"), 2);
@@ -540,10 +678,10 @@ test("export: CSV with PHP fputcsv quoting", () => {
   const d = okData(get("export", { act: "receive" }));
   assert.ok(/^pallet_history_\d{8}_\d{6}\.csv$/.test(d.filename));
   const lines = d.csv.split("\n");
-  assert.strictEqual(lines[0], "เลขที่เอกสาร,วันที่,เวลา,รายการ,รหัส,ประเภท,ขนาด,จำนวน,ฝ่าย,ผู้ทำรายการ,หมายเหตุ");
+  assert.strictEqual(lines[0], "เลขที่เอกสาร,วันที่,เวลา,รายการ,รหัส,ประเภท,ขนาด,จำนวน,ฝ่าย,\"ผู้ทำรายการ (บัญชี)\",ชื่อผู้ใช้,ชื่อที่ระบุ,หมายเหตุ");
   assert.strictEqual(lines.length, 1 + 4 + 1);
   const row = lines.find(l => l.startsWith("RC-" + YMD + "-0001"));
-  assert.strictEqual(row, `RC-${YMD}-0001,${TODAY},${HOUR}:00,รับเข้า,RM,"พาเลทสำหรับใส่ RM",1.2x1.2,50,,"สมชาย ใจดี",PO-123`);
+  assert.strictEqual(row, `RC-${YMD}-0001,${TODAY},${HOUR}:00,รับเข้า,RM,"พาเลทสำหรับใส่ RM",1.2x1.2,50,,"Tester (tester)",tester,"สมชาย ใจดี",PO-123`);
   assert.strictEqual(ctx.csvLine_(['a"b', "c\\\"d", null, 5, "x,y"]), '"a""b","c\\"d",,5,"x,y"\n');
 });
 
@@ -555,11 +693,13 @@ test("logs: categories, filters, order and CSV export", () => {
   const cats = new Set(all.map(i => i.category));
   ["pallet", "repair", "warn"].forEach(c => assert.ok(cats.has(c), c));
   assert.ok(okData(get("logs", { q: "Tester" })).items.length > 0);
+  assert.ok(okData(get("logs")).items.every(l => l.category === "account" || (l.actor === TESTER && l.username === "tester")));
   assert.strictEqual(okData(get("logs", { from: "2099-01-01" })).items.length, 0);
   const x = okData(get("logs_export", { cat: "warn" }));
   assert.ok(/^pallet_log_\d{8}_\d{6}\.csv$/.test(x.filename));
   const lines = x.csv.trim().split("\n");
-  assert.strictEqual(lines[0], "ลำดับ,วันที่,เวลา,หมวด,เลขที่อ้างอิง,รายละเอียด,ผู้ทำรายการ,IP");
+  assert.strictEqual(lines[0], "ลำดับ,วันที่,เวลา,หมวด,เลขที่อ้างอิง,รายละเอียด,ผู้ทำรายการ,ชื่อผู้ใช้,IP");
+  assert.ok(lines.slice(1).every(l => l.includes(',"Tester (tester)",tester,web')));
   assert.ok(lines.slice(1).every(l => l.includes(",ถูกปฏิเสธ,") && l.endsWith(",web")));
 });
 
@@ -576,7 +716,7 @@ test("dept_save: add new, update existing (case-insensitive), validation", () =>
   const log = lastLog();
   assert.strictEqual(log.category, "setting");
   assert.strictEqual(log.detail, "เพิ่ม/แก้ไขฝ่าย: ฝ่ายจัดซื้อ");
-  assert.strictEqual(log.actor, "Tester");
+  assert.strictEqual(log.actor, TESTER);
   okData(post("dept_save", { name: "Office" }));
   okData(post("dept_save", { name: "OFFICE", icon: "", color: "#0EA5E9" }));
   deps = okData(get("bootstrap")).departments;
@@ -641,27 +781,16 @@ test("every write acquires and releases the script lock; lock timeout returns er
   state.lockFail = false;
 });
 
-test("lockout: >10 wrong attempts within 15 min refuses even the right password", () => {
-  state.cache = {};
-  state.cachePuts = [];
-  for (let i = 0; i < 10; i++) err(postRaw({ action: "verifyPassword", password: "guess" + i }), /รหัสไม่ถูกต้อง/);
-  assert.ok(state.cachePuts.every(t => t === 900));
-  const r = err(postRaw({ action: "verifyPassword", password: PW }), /หลายครั้งเกินไป/);
-  assert.strictEqual(r.passwordError, true);
-  const n = dataRows("movements");
-  err(post("receive", Object.assign({ type_id: 1, size: "1.2x1.2", qty: 1 }, AT)), /หลายครั้งเกินไป/);
-  assert.strictEqual(dataRows("movements"), n);
-  state.cache = {}; // 15 minutes later (cache entry expired)
-  okData(postRaw({ action: "verifyPassword", password: PW }));
-});
-
-test("reads work without any password", () => {
-  for (const a of ["bootstrap", "dashboard", "repairs", "history", "export", "logs", "logs_export"]) okData(get(a));
+test("reads work with a session (GET and POST)", () => {
+  for (const a of ["bootstrap", "dashboard", "repairs", "history", "export", "logs", "logs_export", "me"]) {
+    okData(get(a));
+    okData(postRaw({ action: a }));
+  }
 });
 
 /* ---------- reset data ---------- */
 const RPW = "reset-Only-9";
-const reset = (pw, extra = {}) => postRaw(Object.assign({ action: "reset_data", resetPassword: pw, actor: "Admin" }, extra));
+const reset = (pw, extra = {}, tok = T.admin) => postRaw(Object.assign({ action: "reset_data", resetPassword: pw, actor: "Spoofed" }, extra), tok);
 const snapshot = () => ["movements", "repairs", "audit_logs", "pallet_types", "departments"].map(dataRows);
 
 test("reset_data refused while PALLET_RESET_PASSWORD is unset (Thai admin message); GET refused", () => {
@@ -676,22 +805,21 @@ test("reset_data refused while PALLET_RESET_PASSWORD is unset (Thai admin messag
 
 test("reset_data with wrong password (or the action password) is refused, slept, own lockout key", () => {
   state.props.PALLET_RESET_PASSWORD = RPW;
-  state.cache = {};
+  clearFails();
   const before = snapshot();
   const sleeps = state.sleeps;
   const r = err(reset("wrong"), /รหัสไม่ถูกต้อง/);
   assert.strictEqual(r.passwordError, true);
   assert.strictEqual(state.sleeps - sleeps, 1000);
-  err(reset(PW, { password: PW }), /รหัสไม่ถูกต้อง/); // action password is not the reset password
+  err(reset(PW, { password: PW }), /รหัสไม่ถูกต้อง/); // a login password is not the reset password
   err(postRaw({ action: "reset_data", password: RPW }), /รหัสไม่ถูกต้อง/); // must come in resetPassword
   assert.strictEqual(state.cache.PALLET_RESET_FAILURES, "3");
-  assert.ok(!("PALLET_PASSWORD_FAILURES" in state.cache));
   assert.deepStrictEqual(snapshot(), before);
-  state.cache = {};
+  clearFails();
 });
 
 test("reset_data lockout: >10 wrong in 15 min refuses even the right reset password; normal writes unaffected", () => {
-  state.cache = {};
+  clearFails();
   state.cachePuts = [];
   for (let i = 0; i < 10; i++) err(reset("guess" + i), /รหัสไม่ถูกต้อง/);
   assert.ok(state.cachePuts.every(t => t === 900));
@@ -699,8 +827,8 @@ test("reset_data lockout: >10 wrong in 15 min refuses even the right reset passw
   const r = err(reset(RPW), /หลายครั้งเกินไป/);
   assert.strictEqual(r.passwordError, true);
   assert.deepStrictEqual(snapshot(), before);
-  okData(postRaw({ action: "verifyPassword", password: PW })); // separate counter
-  state.cache = {}; // 15 minutes later
+  okData(get("bootstrap")); // normal use unaffected
+  clearFails(); // 15 minutes later
 });
 
 let resetResult;
@@ -730,7 +858,8 @@ test("after reset: audit log contains exactly the reset entry", () => {
   assert.strictEqual(l.id, 1);
   assert.strictEqual(l.category, "setting");
   assert.strictEqual(l.action, "รีเซ็ตข้อมูล");
-  assert.strictEqual(l.actor, "Admin");
+  assert.strictEqual(l.actor, ADMIN);
+  assert.strictEqual(l.username, "admin");
   assert.strictEqual(l.ref, "");
   ["movements", "repairs", "audit_logs"].forEach(n => assert.ok(l.detail.includes(n), n));
   assert.ok(l.detail.includes("(" + resetResult.removed.movements + " แถว)"));
@@ -784,7 +913,7 @@ test("reset_data on already-empty sheets reports zero rows removed", () => {
 });
 
 /* ---------- edit / delete records (reset password) ---------- */
-const rec = (action, body = {}, pw = RPW) => postRaw(Object.assign({}, body, { action, resetPassword: pw, actor: "Editor" }));
+const rec = (action, body = {}, pw = RPW) => postRaw(Object.assign({}, body, { action, resetPassword: pw, actor: "Spoofed" }), T.editor);
 const hist = () => okData(get("history")).items;
 const byDoc = doc => hist().find(m => m.doc_no === doc);
 const rowsOf = n => { const d = sheet(n).data; const h = d[0]; return d.slice(1).filter(r => r.some(v => v !== "" && v != null)).map(r => Object.fromEntries(h.map((k, i) => [k, r[i]]))); };
@@ -797,7 +926,7 @@ const D = {};
 
 test("edit/delete setup: RM + PK movements and repair chains", () => {
   okData(reset(RPW));
-  state.cache = {};
+  clearFails();
   D.r1 = okData(post("receive", Object.assign({ type_id: 1, size: "1.2x1.2", qty: 10 }, at("2026-01-10", "08:00"))));
   D.i1 = okData(post("issue", Object.assign({ type_id: 1, size: "1.2x1.2", qty: 6, department: "ฝ่ายผลิต" }, at("2026-01-10", "09:00"))));
   D.r2 = okData(post("receive", Object.assign({ type_id: 1, size: "1.2x1.2", qty: 5 }, at("2026-01-11", "08:00"))));
@@ -841,7 +970,7 @@ test("edit/delete refused while PALLET_RESET_PASSWORD is unset; GET refused", ()
 });
 
 test("edit/delete with wrong password (or the action password) refused, slept, NOT logged", () => {
-  state.cache = {};
+  clearFails();
   const before = sheetDump();
   const sleeps = state.sleeps;
   const r = err(rec("movement_delete", { id: D.r2.id }, "wrong"), /รหัสไม่ถูกต้อง/);
@@ -851,14 +980,13 @@ test("edit/delete with wrong password (or the action password) refused, slept, N
   err(postRaw({ action: "repair_update", password: RPW, id: D.x.id, cause: "x" }), /รหัสไม่ถูกต้อง/); // must be resetPassword
   err(postRaw({ action: "verifyResetPassword", resetPassword: "nope" }), /รหัสไม่ถูกต้อง/);
   assert.strictEqual(state.cache.PALLET_RESET_FAILURES, "4");
-  assert.ok(!("PALLET_PASSWORD_FAILURES" in state.cache));
   assert.strictEqual(sheetDump(), before);
   assert.deepStrictEqual(okData(postRaw({ action: "verifyResetPassword", resetPassword: RPW })), { valid: true });
-  state.cache = {};
+  clearFails();
 });
 
 test("edit/delete lockout is shared with reset_data", () => {
-  state.cache = {};
+  clearFails();
   for (let i = 0; i < 5; i++) err(reset("guess" + i), /รหัสไม่ถูกต้อง/);
   for (let i = 0; i < 5; i++) err(rec("movement_delete", { id: D.r2.id }, "guess" + i), /รหัสไม่ถูกต้อง/);
   const before = sheetDump();
@@ -867,8 +995,8 @@ test("edit/delete lockout is shared with reset_data", () => {
   err(postRaw({ action: "verifyResetPassword", resetPassword: RPW }), /หลายครั้งเกินไป/);
   err(reset(RPW), /หลายครั้งเกินไป/);
   assert.strictEqual(sheetDump(), before);
-  okData(postRaw({ action: "verifyPassword", password: PW })); // normal password counter unaffected
-  state.cache = {}; // 15 minutes later
+  okData(login("tester", PW)); // login counter unaffected
+  clearFails(); // 15 minutes later
 });
 
 test("delete that would make stock negative is rejected with Thai reason, nothing changed, warn logged", () => {
@@ -884,7 +1012,7 @@ test("delete that would make stock negative is rejected with Thai reason, nothin
   assert.strictEqual(log.category, "warn");
   assert.strictEqual(log.action, "movement_delete");
   assert.strictEqual(log.detail, "ปฏิเสธลบรายการ: " + r.error);
-  assert.strictEqual(log.actor, "Editor");
+  assert.strictEqual(log.actor, EDITOR);
   // deleting the issue would make the "issued" bucket negative when the return happens
   err(rec("movement_delete", { id: D.i1.id }), /^ลบไม่ได้: ยอดเบิกไปใช้งาน RM 1\.2x1\.2 จะติดลบ \(-2\) ณ วันที่ 12\/01\/2026 08:00/);
 });
@@ -909,7 +1037,7 @@ test("delete simple movement: row removed, stock recomputed, audit row, lock use
   assert.strictEqual(log.category, "pallet");
   assert.strictEqual(log.action, "ลบรายการ");
   assert.strictEqual(log.ref, D.r2.doc_no);
-  assert.strictEqual(log.actor, "Editor");
+  assert.strictEqual(log.actor, EDITOR);
   assert.ok(log.detail.startsWith(`ลบรายการ ${D.r2.doc_no}: รับเข้า RM (พาเลทสำหรับใส่ RM) ขนาด 1.2x1.2 ม. จำนวน 5 ตัว · วันที่ 11/01/2026 08:00`), log.detail);
   // stale id / doc_no
   err(rec("movement_delete", { id: D.r2.id, doc_no: D.r2.doc_no }), /ไม่พบรายการเคลื่อนไหว/);
@@ -978,8 +1106,11 @@ test("edit department / person / note; department checks; immutable fields; no-o
   okData(rec("movement_update", { id: D.r1.id, person: " สมหญิง ", note: "แก้ PO" }));
   const m = byDoc(D.r1.doc_no);
   assert.deepStrictEqual([m.person, m.note, m.qty], ["สมหญิง", "แก้ PO", 10]);
-  assert.strictEqual(lastLog().detail, `แก้ไขรายการ ${D.r1.doc_no} (รับเข้า RM ขนาด 1.2x1.2): ผู้ทำรายการ "" → "สมหญิง"; หมายเหตุ "" → "แก้ PO"`);
-  assert.strictEqual(lastLog().actor, "Editor");
+  assert.strictEqual(lastLog().detail, `แก้ไขรายการ ${D.r1.doc_no} (รับเข้า RM ขนาด 1.2x1.2): ชื่อที่ระบุ "" → "สมหญิง"; หมายเหตุ "" → "แก้ PO"`);
+  assert.strictEqual(lastLog().actor, EDITOR);
+  assert.strictEqual(m.actor, TESTER); // who recorded the movement is never edited
+  okData(rec("movement_update", { id: D.r1.id, actor: "Hacker", username: "admin" })); // ignored fields
+  assert.deepStrictEqual([byDoc(D.r1.doc_no).actor, byDoc(D.r1.doc_no).username], [TESTER, "tester"]);
   for (const f of [{ type_id: 2 }, { size: "1.1x1.1" }, { from_status: "damaged" }, { to_status: "issued" }]) {
     err(rec("movement_update", Object.assign({ id: D.r1.id }, f)), /ลบรายการนี้แล้วบันทึกใหม่/);
   }
@@ -1022,15 +1153,19 @@ test("repair chain: qty edit propagates to every chain movement and the ticket; 
 });
 
 test("repair_update: cause / reported_by / repairer / note only; audit before→after", () => {
-  const d = okData(rec("repair_update", { id: D.x.id, ticket_no: D.x.ticket_no, cause: "ไม้หักสองแผ่น", repairer: "ช่างสอง", reported_by: "ผู้แจ้ง", note: "บันทึก\nบรรทัดสอง" }));
+  err(rec("repair_update", { id: D.x.id, reported_by: "ผู้แจ้งปลอม" }), /บันทึกจากบัญชีผู้ใช้โดยอัตโนมัติ/);
+  err(rec("repair_update", { id: D.x.id, updated_by: "x" }), /แก้ไขไม่ได้/);
+  const d = okData(rec("repair_update", { id: D.x.id, ticket_no: D.x.ticket_no, cause: "ไม้หักสองแผ่น", repairer: "ช่างสอง", reported_by: TESTER, note: "บันทึก\nบรรทัดสอง" }));
   assert.strictEqual(d.message, "แก้ไขใบแจ้งซ่อม " + D.x.ticket_no + " แล้ว");
   const t = ticketOf(D.x.id);
-  assert.deepStrictEqual([t.cause, t.repairer, t.reported_by, t.note, t.qty, t.stage], ["ไม้หักสองแผ่น", "ช่างสอง", "ผู้แจ้ง", "บันทึก\nบรรทัดสอง", 4, "done"]);
+  assert.deepStrictEqual([t.cause, t.repairer, t.reported_by, t.note, t.qty, t.stage], ["ไม้หักสองแผ่น", "ช่างสอง", TESTER, "บันทึก\nบรรทัดสอง", 4, "done"]);
+  assert.deepStrictEqual([t.updated_by, t.updated_username], [EDITOR, "editor"]);
   const log = lastLog();
   assert.strictEqual(log.category, "repair");
   assert.strictEqual(log.action, "แก้ไขใบแจ้งซ่อม");
   assert.strictEqual(log.ref, D.x.ticket_no);
-  assert.ok(log.detail.startsWith(`แก้ไขใบแจ้งซ่อม ${D.x.ticket_no}: สาเหตุการชำรุด "หัก" → "ไม้หักสองแผ่น"; ผู้แจ้ง "" → "ผู้แจ้ง"; ช่างผู้ซ่อม "" → "ช่างสอง"`), log.detail);
+  assert.strictEqual(log.actor, EDITOR);
+  assert.ok(log.detail.startsWith(`แก้ไขใบแจ้งซ่อม ${D.x.ticket_no}: สาเหตุการชำรุด "หัก" → "ไม้หักสองแผ่น"; ช่างผู้ซ่อม "Tester" → "ช่างสอง"`), log.detail);
   err(rec("repair_update", { id: D.x.id, qty: 9 }), /แก้ไขจำนวน\/สถานะ/);
   err(rec("repair_update", { id: D.x.id, stage: "damaged" }), /แก้ไขจำนวน\/สถานะ/);
   err(rec("repair_update", { id: D.x.id, note: "x".repeat(1001) }), /ยาวเกิน 1000/);
@@ -1101,6 +1236,206 @@ test("deleting the last data rows keeps a spare sheet row (Sheets cannot delete 
   assert.strictEqual(state.locks, state.unlocks);
 });
 
+/* ---------- attribution & account management ---------- */
+test("actor is decided by the server: fake person/actor/reported_by from the client never becomes the actor", () => {
+  okData(postRaw(Object.assign({ action: "receive", type_id: 3, size: "1.2x1.2", qty: 5, actor: "Hacker", username: "admin", person: "ใครก็ได้" }, AT), T.editor));
+  const d = okData(post("damage", Object.assign({ type_id: 3, size: "1.2x1.2", qty: 1, cause: "แตก", person: "Fake", reported_by: "Fake", reported_username: "admin", actor: "Fake" }, AT), T.editor));
+  const m = byDoc(d.doc_no);
+  assert.deepStrictEqual([m.actor, m.username, m.person], [EDITOR, "editor", "Fake"]);
+  const t = rowsOf("repairs").pop();
+  assert.deepStrictEqual([t.reported_by, t.reported_username], [EDITOR, "editor"]);
+  const rp = okData(post("repair_start", Object.assign({ id: t.id, actor: "Fake" }, AT)));
+  const t2 = ticketOf(t.id);
+  assert.deepStrictEqual([t2.reported_by, t2.updated_by, t2.updated_username, t2.repairer], [EDITOR, TESTER, "tester", "Tester"]);
+  assert.strictEqual(byDoc(rp.doc_no).actor, TESTER);
+  const logs = okData(get("logs")).items.slice(0, 3);
+  assert.deepStrictEqual(logs.map(l => l.actor), [TESTER, EDITOR, EDITOR]);
+  assert.ok(!JSON.stringify(state.spreadsheets[state.props.PALLET_SPREADSHEET_ID].sheets.map(x => x.data)).includes("Hacker"));
+  okData(rec("repair_delete", { id: t.id })); // tidy up
+});
+
+test("change_password: wrong old password refused (1 s), min 8, success rotates sessions, audit row", () => {
+  const second = okData(login("tester", PW)).token; // the same user on another device
+  const sleeps = state.sleeps;
+  err(post("change_password", { old_password: "nope", new_password: "newPass-123" }), /รหัสผ่านเดิมไม่ถูกต้อง/);
+  assert.strictEqual(state.sleeps - sleeps, 1000);
+  err(post("change_password", { old_password: PW, new_password: "short" }), /อย่างน้อย 8/);
+  const d = okData(post("change_password", { old_password: PW, new_password: "newPass-123" }));
+  assert.ok(/^[a-f0-9]{64}$/.test(d.token) && d.token !== T.tester);
+  authErr(get("bootstrap"));            // this browser's old token
+  authErr(get("bootstrap", {}, second)); // and the other device
+  T.tester = d.token;
+  okData(get("bootstrap"));
+  err(login("tester", PW), /ไม่ถูกต้อง/);
+  T.tester = okData(login("tester", "newPass-123")).token;
+  const l = okData(get("logs", { cat: "account" }, T.admin)).items.find(x => x.action === "change_password");
+  assert.deepStrictEqual([l.actor, l.username, l.ref], [TESTER, "tester", "tester"]);
+  assert.ok(!JSON.stringify(sheet("audit_logs").data).includes("newPass-123"));
+  clearFails();
+});
+
+test("admin reset password ends that user's sessions; own reset keeps the admin logged in", () => {
+  const tester = userRows().find(u => u.username === "tester");
+  err(post("user_reset_password", { id: tester.id, password: "1234567" }, T.admin), /อย่างน้อย 8/);
+  err(post("user_reset_password", { id: 999, password: "12345678" }, T.admin), /ไม่พบผู้ใช้/);
+  okData(post("user_reset_password", { id: tester.id, password: PW }, T.admin));
+  authErr(get("bootstrap"));
+  err(login("tester", "newPass-123"), /ไม่ถูกต้อง/);
+  T.tester = okData(login("tester", PW)).token;
+  const own = okData(post("user_reset_password", { id: 1, password: "admin-New-99" }, T.admin));
+  assert.ok(own.token);
+  authErr(get("me", {}, T.admin));
+  authErr(get("me", {}, T.admin2));
+  T.admin = own.token;
+  assert.strictEqual(okData(get("me", {}, T.admin)).user.username, "admin");
+  const l = okData(get("logs", { cat: "account" }, T.admin)).items.find(x => x.action === "user_reset_password" && x.ref === "tester");
+  assert.strictEqual(l.actor, ADMIN);
+  clearFails();
+});
+
+test("initial admin password is not used once accounts exist", () => {
+  err(login("admin", ADMIN_PW), /ไม่ถูกต้อง/); // admin password was changed above
+  assert.strictEqual(userRows().filter(u => u.username === "admin").length, 1);
+  delete state.props.PALLET_INITIAL_ADMIN_PASSWORD;
+  T.admin = okData(login("admin", "admin-New-99")).token;
+  clearFails();
+});
+
+test("user_save update / user_toggle: disabling ends sessions and blocks login; re-enable works", () => {
+  const editor = userRows().find(u => u.username === "editor");
+  const save = b => post("user_save", b, T.admin);
+  const r = okData(save({ id: editor.id, fullname: "Editor", role: "user", active: 1 }));
+  assert.strictEqual(r.changed, false);
+  okData(save({ id: editor.id, fullname: "Editor", active: 0 }));
+  authErr(get("bootstrap", {}, T.editor));
+  err(login("editor", EDITOR_PW), /ไม่ถูกต้อง/);
+  okData(post("user_toggle", { id: editor.id }, T.admin)); // enable again
+  assert.strictEqual(userRows().find(u => u.username === "editor").active, 1);
+  T.editor = okData(login("editor", EDITOR_PW)).token;
+  okData(post("user_toggle", { id: editor.id }, T.admin)); // disable
+  authErr(get("bootstrap", {}, T.editor));
+  okData(post("user_toggle", { id: editor.id }, T.admin)); // enable
+  T.editor = okData(login("editor", EDITOR_PW)).token;
+  const acts = okData(get("logs", { cat: "account" }, T.admin)).items.filter(l => l.ref === "editor").map(l => l.action);
+  assert.ok(acts.includes("user_update") && acts.includes("user_toggle"));
+  // rename + role change are read fresh on every request
+  okData(save({ id: editor.id, fullname: "Editor Two", role: "admin" }));
+  okData(get("users", {}, T.editor)); // now an admin
+  okData(save({ id: editor.id, fullname: "Editor", role: "user" }));
+  err(get("users", {}, T.editor), /เฉพาะผู้ดูแลระบบ/);
+  const upd = okData(get("logs", { cat: "account" }, T.admin)).items.find(l => l.action === "user_update");
+  assert.ok(upd.detail.includes("บทบาท ผู้ดูแลระบบ → ผู้ใช้งาน"), upd.detail);
+  clearFails();
+});
+
+test("last active admin cannot be disabled or demoted (also not by themselves)", () => {
+  const before = JSON.stringify(sheet("users").data);
+  err(post("user_toggle", { id: 1 }, T.admin), /อย่างน้อย 1 คน/);
+  err(post("user_save", { id: 1, fullname: "ผู้ดูแลระบบ", role: "user" }, T.admin), /อย่างน้อย 1 คน/);
+  err(post("user_save", { id: 1, fullname: "ผู้ดูแลระบบ", active: 0 }, T.admin), /อย่างน้อย 1 คน/);
+  assert.strictEqual(JSON.stringify(sheet("users").data), before);
+  // with a second admin, the first may step down
+  const editor = userRows().find(u => u.username === "editor");
+  okData(post("user_save", { id: editor.id, fullname: "Editor", role: "admin" }, T.admin));
+  okData(post("user_save", { id: 1, fullname: "ผู้ดูแลระบบ", role: "user" }, T.admin));
+  err(get("users", {}, T.admin), /เฉพาะผู้ดูแลระบบ/);
+  err(post("user_toggle", { id: editor.id }, T.editor), /อย่างน้อย 1 คน/); // editor is now the last admin
+  okData(post("user_save", { id: 1, fullname: "ผู้ดูแลระบบ", role: "admin" }, T.editor));
+  okData(post("user_save", { id: editor.id, fullname: "Editor", role: "user" }, T.admin));
+  // a disabled admin does not count
+  okData(post("user_save", { username: "boss2", fullname: "Boss", role: "admin", password: "boss-Pass-1", active: 0 }, T.admin));
+  err(post("user_save", { id: 1, fullname: "ผู้ดูแลระบบ", role: "user" }, T.admin), /อย่างน้อย 1 คน/);
+});
+
+test("logout ends the session and is logged", () => {
+  const tok = okData(login("tester", PW)).token;
+  const d = okData(post("logout", {}, tok));
+  assert.strictEqual(d.message, "ออกจากระบบแล้ว");
+  authErr(get("bootstrap", {}, tok));
+  authErr(post("logout", {}, tok));
+  okData(get("bootstrap")); // the other session of the same user is unaffected
+  const l = okData(get("logs", { cat: "account" }, T.admin)).items[0];
+  assert.deepStrictEqual([l.action, l.actor, l.username], ["logout", TESTER, "tester"]);
+  assert.strictEqual(state.locks, state.unlocks);
+});
+
+/* ---------- migration of an existing (pre-login) spreadsheet ---------- */
+const LEGACY_HEADERS = {
+  pallet_types: ["id", "tkey", "code", "name", "short", "description", "color", "sizes", "sort"],
+  departments: ["id", "name", "icon", "color", "active"],
+  repairs: ["id", "ticket_no", "type_id", "size", "qty", "stage", "source", "department", "cause", "reported_by", "repairer", "reported_at", "started_at", "finished_at", "note"],
+  movements: ["id", "doc_no", "action", "type_id", "size", "qty", "from_status", "to_status", "department", "person", "note", "repair_id", "moved_at", "created_at"],
+  audit_logs: ["id", "category", "action", "ref", "detail", "actor", "ip", "created_at"]
+};
+function legacyInstance() {
+  const g = createGas();
+  const c = loadCode(g.gas);
+  const ss = g.gas.SpreadsheetApp.create("Pallet Hub Database");
+  ss.sheets = [];
+  g.state.props.PALLET_SPREADSHEET_ID = ss.getId();
+  for (const [name, h] of Object.entries(LEGACY_HEADERS)) {
+    const sh = ss.insertSheet(name);
+    sh.data.push(h.slice());
+    sh.maxCols = h.length; // a tight sheet: new columns need insertColumnsAfter
+    sh.frozen = 1;
+  }
+  ss.getSheetByName("pallet_types").data.push([1, "RM", "RM", "พาเลท RM", "RM", "วัตถุดิบ", "#1E6FE0", "1.2x1.2", 1]);
+  ss.getSheetByName("departments").data.push([1, "ฝ่ายผลิต", "fa-industry", "#E2231A", 1]);
+  ss.getSheetByName("movements").data.push([1, "RC-260101-0001", "receive", 1, "1.2x1.2", 10, "", "available", "", "คนเก่า", "ของเดิม", "", "2026-01-01 08:00:00", "2026-01-01 08:00:00"]);
+  ss.getSheetByName("audit_logs").data.push([1, "pallet", "receive", "RC-260101-0001", "รับเข้าเดิม", "คนเก่า", "web", "2026-01-01 08:00:00"]);
+  const G = (action, tok, params = {}) => JSON.parse(c.doGet({ parameter: Object.assign({ action, token: tok }, params) }).getContent());
+  const P = (payload) => JSON.parse(c.doPost({ postData: { contents: JSON.stringify(payload) } }).getContent());
+  return { g, c, ss, G, P, sh: n => ss.getSheetByName(n) };
+}
+
+test("existing spreadsheet without users sheet: first login creates it; old sheets gain new columns; old data intact", () => {
+  const L = legacyInstance();
+  L.g.state.props.PALLET_INITIAL_ADMIN_PASSWORD = "legacy-Admin-1";
+  assert.strictEqual(L.sh("users"), null);
+  const tok = okData(L.P({ action: "login", username: "admin", password: "legacy-Admin-1" })).token;
+  assert.ok(L.sh("users"));
+  assert.deepStrictEqual(L.sh("users").data[0], ["id", "username", "password_hash", "salt", "fullname", "role", "active", "created_at", "updated_at", "last_login"]);
+  assert.strictEqual(L.sh("users").getLastRow(), 2);
+  assert.deepStrictEqual(L.sh("audit_logs").data[0], LEGACY_HEADERS.audit_logs.concat(["username"]));
+  // reads upgrade movements; the legacy row reads its new columns as empty
+  const h = okData(L.G("history", tok)).items;
+  assert.deepStrictEqual(L.sh("movements").data[0], LEGACY_HEADERS.movements.concat(["actor", "username"]));
+  assert.deepStrictEqual([h[0].doc_no, h[0].person, h[0].actor, h[0].username, h[0].from_status], ["RC-260101-0001", "คนเก่า", "", "", null]);
+  assert.strictEqual(L.sh("movements").data[1][9], "คนเก่า");
+  const logs = okData(L.G("logs", tok)).items;
+  assert.deepStrictEqual(logs.find(l => l.id === 1), { id: 1, category: "pallet", action: "receive", ref: "RC-260101-0001", detail: "รับเข้าเดิม", actor: "คนเก่า", ip: "web", created_at: "2026-01-01 08:00:00", username: "" });
+  // writes work and attribute the user; repairs gains its columns
+  okData(L.P({ action: "receive", token: tok, type_id: 1, size: "1.2x1.2", qty: 2 }));
+  okData(L.P({ action: "damage", token: tok, type_id: 1, size: "1.2x1.2", qty: 1, cause: "x" }));
+  assert.deepStrictEqual(L.sh("repairs").data[0], LEGACY_HEADERS.repairs.concat(["reported_username", "updated_by", "updated_username", "updated_at"]));
+  const t = okData(L.G("repairs", tok)).items[0];
+  assert.deepStrictEqual([t.reported_by, t.reported_username], [ADMIN, "admin"]);
+  const st = okData(L.G("bootstrap", tok)).stock;
+  assert.strictEqual(stockOf(st, 1, "1.2x1.2", "available"), 11);
+  assert.ok(L.g.state.colInserts >= 3);
+  assert.ok(okData(L.G("history", tok)).items.slice(0, 2).every(m => m.actor === ADMIN));
+  // setupSystem afterwards is harmless and keeps the account
+  const r = L.c.setupSystem();
+  assert.strictEqual(r.created, false);
+  assert.strictEqual(r.users, 1);
+  okData(L.G("me", tok));
+});
+
+test("existing spreadsheet upgraded by re-running setupSystem (users sheet + columns added, data kept)", () => {
+  const L = legacyInstance();
+  const r = L.c.setupSystem();
+  assert.strictEqual(r.created, false);
+  assert.strictEqual(r.users, 0);
+  assert.deepStrictEqual(L.ss.getSheets().map(s => s.getName()), ["pallet_types", "departments", "repairs", "movements", "audit_logs", "users"]);
+  assert.deepStrictEqual(L.sh("movements").data[0], LEGACY_HEADERS.movements.concat(["actor", "username"]));
+  assert.deepStrictEqual(L.sh("audit_logs").data[0], LEGACY_HEADERS.audit_logs.concat(["username"]));
+  assert.strictEqual(L.sh("movements").data[1][1], "RC-260101-0001");
+  assert.strictEqual(L.sh("pallet_types").getLastRow(), 2); // no re-seeding over existing data
+  assert.strictEqual(r.initialAdminPasswordConfigured, false);
+  const e = err(L.P({ action: "login", username: "admin", password: "x" }), /PALLET_INITIAL_ADMIN_PASSWORD/);
+  assert.strictEqual(e.code, "SETUP");
+});
+
 /* ---------- frontend syntax ---------- */
 test("docs JS files parse (new Function)", () => {
   for (const f of ["docs/config.js", "docs/assets/app.js"]) {
@@ -1120,7 +1455,12 @@ test("docs JS files parse (new Function)", () => {
   assert.ok(app.includes("resetPassword: pw }"));
   assert.ok(/data-medit=.*✏️ แก้ไข/.test(app) && /data-mdel=.*🗑 ลบ/.test(app) && /data-redit=.*data-rdel=/.test(app));
   const html = fs.readFileSync(path.join(ROOT, "docs/index.html"), "utf8");
-  assert.ok(html.includes('assets/app.js?v=14"'));
+  assert.ok(html.includes('assets/app.js?v=15"'));
+  assert.ok(html.includes('id="loginScreen"') && html.includes('data-page="account"'));
+  assert.ok(!/verifyPassword'|actionPassword|palletUser/.test(app)); // old shared password / typed-name features removed
+  for (const a of ["login", "logout", "me", "change_password", "users", "user_save", "user_reset_password", "user_toggle"]) assert.ok(app.includes(`'${a}'`), a);
+  assert.ok(/code === 'AUTH'/.test(app));
+  assert.ok(app.includes("ผู้ทำรายการ / By"));
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

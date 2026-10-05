@@ -3,10 +3,14 @@ const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const view = $('#view');
 const S = { types: [], depts: [], stock: {}, dept: [], charts: [] };
-const store = (fn, k, v) => { try { return fn === 'get' ? localStorage.getItem(k) : localStorage.setItem(k, v); } catch { return null; } };
+const store = (fn, k, v) => { try { return fn === 'get' ? localStorage.getItem(k) : fn === 'del' ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch { return null; } };
 const sessionGet = k => { try { return sessionStorage.getItem(k); } catch { return null; } };
 const sessionSet = (k, v) => { try { sessionStorage.setItem(k, v); } catch {} };
-S.user = store('get', 'palletUser') || '';
+/* เข้าสู่ระบบ: session token (จาก action login) เก็บใน localStorage — ไม่เก็บรหัสผ่าน
+   ผู้ทำรายการในประวัติ/Log เซิร์ฟเวอร์บันทึกจากบัญชีที่เข้าสู่ระบบเอง (ไม่ได้มาจากหน้าเว็บ) */
+const TOKEN_KEY = 'palletToken';
+let authToken = store('get', TOKEN_KEY) || '';
+S.me = null;
 
 const STATUS = {
   available: { name: 'พร้อมใช้', icon: 'fa-circle-check', c: '#12b76a' },
@@ -35,13 +39,14 @@ const PAGES = {
   history: ['ประวัติเคลื่อนไหว', 'ทุกการเคลื่อนไหวของพาเลท ค้นหา / ส่งออก Excel'],
   logs: ['บันทึกประวัติ (Log)', 'ทุกการกระทำในระบบ — ใคร ทำอะไร เมื่อไร'],
   settings: ['ตั้งค่าฝ่าย', 'จัดการรายชื่อฝ่ายที่เบิกจ่ายพาเลท'],
+  account: ['ตั้งค่าบัญชี', 'บัญชีผู้ใช้ รหัสผ่าน และสิทธิ์การใช้งาน'],
 };
 
 /* ---------- API (Google Apps Script web app) ---------- */
-// อ่านข้อมูล = GET ?action=...  /  บันทึก = POST text/plain (JSON) — ไม่เกิด CORS preflight
+// อ่านข้อมูล = GET ?action=...&token=...  /  บันทึก = POST text/plain (JSON) — ไม่เกิด CORS preflight
+// ทุกคำสั่งต้องมี session token (เข้าสู่ระบบ) — เซิร์ฟเวอร์ตอบ code 'AUTH' เมื่อยังไม่เข้าสู่ระบบ/หมดอายุ
 const API_URL = String((window.PALLET_CONFIG || {}).apiUrl || '').trim();
 const NO_API_MSG = 'ยังไม่ได้ตั้งค่า apiUrl — ใส่ URL ของ Google Apps Script (/exec) ในไฟล์ docs/config.js';
-let actionPassword = ''; // รหัสผ่านเก็บในหน่วยความจำเท่านั้น (หายเมื่อรีเฟรช/ปิดหน้า)
 async function gasFetch(url, opt) {
   let j;
   try {
@@ -51,6 +56,8 @@ async function gasFetch(url, opt) {
   if (!j || !j.ok) {
     const e = new Error((j && j.error) || 'เกิดข้อผิดพลาด');
     e.passwordError = !!(j && j.passwordError);
+    e.code = (j && j.code) || '';
+    if (e.code === 'AUTH') authLost(); // token หมดอายุ / ถูกปิดบัญชี / เปลี่ยนรหัสผ่าน → กลับหน้าเข้าสู่ระบบ
     throw e;
   }
   return { ok: true, ...(j.data || {}) };
@@ -60,53 +67,41 @@ function gasGet(action, params = '') {
   const u = new URL(API_URL, location.href);
   new URLSearchParams(params.replace(/^&/, '')).forEach((v, k) => u.searchParams.set(k, v));
   u.searchParams.set('action', action);
+  u.searchParams.set('token', authToken);
   u.searchParams.set('_', Date.now());
   return gasFetch(u.toString(), { method: 'GET' });
 }
 function gasPost(payload) {
   if (!API_URL) return Promise.reject(new Error(NO_API_MSG));
-  return gasFetch(API_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=UTF-8' }, body: JSON.stringify(payload) });
+  return gasFetch(API_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=UTF-8' }, body: JSON.stringify({ ...payload, token: authToken }) });
 }
 async function api(action, body, params = '') {
   if (!body) return gasGet(action, params);
-  const password = await askPassword();
-  try {
-    return await gasPost({ ...body, action, actor: S.user || '', password });
-  } catch (e) {
-    if (e.passwordError) actionPassword = ''; // รหัสผิด/ถูกล็อก → ถามใหม่ครั้งหน้า
-    throw e;
-  }
+  return gasPost({ ...body, action });
 }
-/* แก้ไข / ลบรายการที่บันทึกแล้ว: ใช้รหัสรีเซ็ตข้อมูล (PALLET_RESET_PASSWORD) ไม่ใช้รหัสบันทึกปกติ
-   เก็บในหน่วยความจำเท่านั้นหลังตรวจผ่าน (หายเมื่อรีเฟรช/ปิดหน้า) และล้างทิ้งเมื่อเซิร์ฟเวอร์แจ้งรหัสผิด/ถูกล็อก */
+/* แก้ไข / ลบรายการที่บันทึกแล้ว: ใช้รหัสรีเซ็ตข้อมูล (PALLET_RESET_PASSWORD) เพิ่มจากการเข้าสู่ระบบ
+   เก็บในหน่วยความจำเท่านั้นหลังตรวจผ่าน (หายเมื่อรีเฟรช/ปิดหน้า/ออกจากระบบ) และล้างทิ้งเมื่อเซิร์ฟเวอร์แจ้งรหัสผิด/ถูกล็อก */
 let recordPassword = '';
 async function recordApi(action, body) {
   const pw = await askPassword('record');
   try {
-    return await gasPost({ ...body, action, actor: S.user || '', resetPassword: pw });
+    return await gasPost({ ...body, action, resetPassword: pw });
   } catch (e) {
     if (e.passwordError) recordPassword = '';
     throw e;
   }
 }
 const PW_KIND = {
-  action: {
-    title: 'ยืนยันรหัสผ่าน', label: 'รหัสผ่าน', icon: 'fa-lock',
-    desc: 'การบันทึก / แก้ไขข้อมูลต้องใช้รหัสผ่านของระบบ (ถามครั้งเดียวต่อการเปิดหน้านี้)',
-    cancel: 'ยกเลิกการบันทึก — ต้องใส่รหัสผ่านก่อนบันทึกข้อมูล',
-    get: () => actionPassword, set: v => { actionPassword = v; },
-    verify: pw => gasPost({ action: 'verifyPassword', password: pw }),
-  },
   record: {
     title: 'รหัสรีเซ็ตข้อมูล (แก้ไข / ลบรายการ)', label: 'รหัสรีเซ็ตข้อมูล', icon: 'fa-user-shield',
-    desc: 'การแก้ไขหรือลบรายการที่บันทึกแล้วต้องใช้รหัสรีเซ็ตข้อมูล (ตั้งโดยผู้ดูแลระบบ — คนละรหัสกับรหัสบันทึกข้อมูล · ถามครั้งเดียวต่อการเปิดหน้านี้)',
+    desc: 'การแก้ไขหรือลบรายการที่บันทึกแล้วต้องใช้รหัสรีเซ็ตข้อมูล (ตั้งโดยผู้ดูแลระบบ — คนละรหัสกับรหัสเข้าสู่ระบบ · ถามครั้งเดียวต่อการเปิดหน้านี้)',
     cancel: 'ยกเลิก — ต้องใส่รหัสรีเซ็ตข้อมูลก่อนแก้ไข/ลบรายการ',
     get: () => recordPassword, set: v => { recordPassword = v; },
     verify: pw => gasPost({ action: 'verifyResetPassword', resetPassword: pw }),
   },
 };
-/* ถามรหัสผ่านครั้งเดียวต่อการเปิดหน้า แล้วตรวจกับเซิร์ฟเวอร์ (verifyPassword / verifyResetPassword) */
-function askPassword(kind = 'action') {
+/* ถามรหัสครั้งเดียวต่อการเปิดหน้า แล้วตรวจกับเซิร์ฟเวอร์ (verifyResetPassword) */
+function askPassword(kind = 'record') {
   const K = PW_KIND[kind];
   if (K.get()) return Promise.resolve(K.get());
   S.pwPending ||= {};
@@ -123,6 +118,7 @@ function askPassword(kind = 'action') {
     const inp = $('#pwInput', card), ok = $('#pwOk', card), err = $('#pwErr', card);
     const done = () => { box.hidden = true; box.onclick = null; card.innerHTML = ''; };
     const cancel = () => { done(); reject(new Error(K.cancel)); };
+    S.pwCancel = cancel;
     const submit = async () => {
       const pw = inp.value;
       if (!pw) { err.textContent = 'กรุณาใส่' + K.label; inp.focus(); return; }
@@ -131,6 +127,7 @@ function askPassword(kind = 'action') {
         await K.verify(pw);
         K.set(pw); done(); resolve(pw);
       } catch (e) {
+        if (e.code === 'AUTH') { done(); reject(e); return; }
         err.textContent = e.message; inp.value = ''; inp.focus();
         ok.disabled = false; ok.innerHTML = '<i class="fa-solid fa-unlock"></i>ยืนยัน';
       }
@@ -140,7 +137,7 @@ function askPassword(kind = 'action') {
     box.onclick = e => { if (e.target === box) cancel(); };
     inp.onkeydown = e => { e.stopPropagation(); if (e.key === 'Enter') submit(); if (e.key === 'Escape') cancel(); };
     inp.focus();
-  }).finally(() => { S.pwPending[kind] = null; });
+  }).finally(() => { S.pwPending[kind] = null; S.pwCancel = null; });
   return S.pwPending[kind];
 }
 /* ส่งออก Excel (CSV) — เซิร์ฟเวอร์สร้าง CSV แล้วดาวน์โหลดเป็นไฟล์ในเบราว์เซอร์ */
@@ -295,25 +292,88 @@ document.addEventListener('animationend', e => {
   }
 });
 
-/* current user (stored per browser) — sent with every write request for the audit log */
+/* ================= LOGIN / SESSION ================= */
+const ROLE = { admin: ['ผู้ดูแลระบบ', '#E2231A', 'fa-user-shield'], user: ['ผู้ใช้งาน', '#0ea5e9', 'fa-user'] };
+const roleTag = r => { const x = ROLE[r] || [r, '#667085', 'fa-user']; return `<span class="tag" style="--c:${x[1]}"><i class="fa-solid ${x[2]}"></i>${esc(x[0])}</span>`; };
+const isAdmin = () => S.me?.role === 'admin';
+function setMe(u) { S.me = u || null; paintUser(); }
+function setToken(t) { authToken = t || ''; if (authToken) store('set', TOKEN_KEY, authToken); else store('del', TOKEN_KEY); }
 function paintUser() {
-  $('#userName').textContent = S.user || 'ระบุชื่อผู้ใช้';
-  $('#userAv').innerHTML = S.user ? esc(S.user.trim().charAt(0)) : '<i class="fa-solid fa-user"></i>';
+  const u = S.me;
+  $('#userName').textContent = u ? u.fullname || u.username : '—';
+  $('#userAv').innerHTML = u ? esc((u.fullname || u.username).trim().charAt(0).toUpperCase()) : '<i class="fa-solid fa-user"></i>';
+  $('#umName').textContent = u ? u.fullname || u.username : '';
+  $('#umInfo').textContent = u ? `${u.username} · ${(ROLE[u.role] || [u.role])[0]}` : '';
+  $('#userChip').title = u ? `เข้าสู่ระบบเป็น ${u.fullname} (${u.username})` : 'บัญชีผู้ใช้';
 }
-$('#userChip').onclick = () => {
-  const m = modal(`<h3><i class="fa-solid fa-user-pen" style="color:var(--brand)"></i> ผู้ใช้งาน</h3>
-    <p style="color:var(--muted)">ชื่อนี้จะถูกบันทึกในประวัติทุกรายการ และกรอกช่อง “ผู้ทำรายการ” ให้อัตโนมัติ</p>
-    <div class="field mt"><label>ชื่อ - นามสกุล</label><input id="uName" value="${esc(S.user)}" placeholder="เช่น สมชาย ใจดี"></div>
-    <div class="modal-acts"><button class="btn btn-ghost" data-close>ยกเลิก</button><button class="btn btn-primary" id="uSave"><i class="fa-solid fa-check"></i>บันทึก</button></div>`);
-  const inp = $('#uName', m); inp.focus(); inp.select();
-  const save = () => { S.user = inp.value.trim().slice(0, 60); store('set', 'palletUser', S.user); paintUser(); closeModal(); toast(S.user ? `สวัสดีคุณ${S.user}` : 'ล้างชื่อผู้ใช้แล้ว', 'info'); route(); };
-  $('#uSave', m).onclick = save;
-  inp.onkeydown = e => e.key === 'Enter' && save();
+function showLogin(msg = '') {
+  closeUserMenu();
+  closeModal();
+  S.pwCancel?.();
+  const box = $('#loginScreen');
+  box.classList.remove('checking');
+  box.hidden = false;
+  $('#lgErr').textContent = msg;
+  $('#lgPass').value = '';
+  const btn = $('#lgBtn'); btn.disabled = false; btn.innerHTML = '<i class="fa-solid fa-right-to-bracket"></i>เข้าสู่ระบบ';
+  setTimeout(() => ($('#lgUser').value ? $('#lgPass') : $('#lgUser')).focus(), 50);
+}
+function hideLogin() { $('#loginScreen').hidden = true; $('#lgPass').value = ''; $('#lgErr').textContent = ''; }
+/* เซิร์ฟเวอร์ตอบ AUTH (ยังไม่เข้าสู่ระบบ / เซสชันหมดอายุ / บัญชีถูกปิด / รหัสผ่านถูกเปลี่ยน) */
+function authLost() {
+  const had = !!authToken;
+  setToken(''); setMe(null); recordPassword = '';
+  showLogin(had ? 'เซสชันหมดอายุหรือถูกยกเลิก กรุณาเข้าสู่ระบบใหม่' : '');
+}
+$('#loginForm').onsubmit = async e => {
+  e.preventDefault();
+  const user = $('#lgUser').value.trim(), pass = $('#lgPass').value, btn = $('#lgBtn'), err = $('#lgErr');
+  if (!user || !pass) { err.textContent = 'กรุณากรอกชื่อผู้ใช้และรหัสผ่าน'; return; }
+  btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> กำลังเข้าสู่ระบบ...'; err.textContent = '';
+  try {
+    const r = await gasPost({ action: 'login', username: user, password: pass });
+    setToken(r.token); setMe(r.user); hideLogin();
+    toast(`สวัสดีคุณ${r.user.fullname || r.user.username}`, 'info');
+    if (r.initial) { toast('สร้างบัญชีผู้ดูแลระบบแล้ว — กรุณาเปลี่ยนรหัสผ่านที่ “ตั้งค่าบัญชี”', 'info'); location.hash = 'account'; }
+    route();
+  } catch (x) {
+    err.textContent = x.message; $('#lgPass').value = ''; $('#lgPass').focus();
+    btn.disabled = false; btn.innerHTML = '<i class="fa-solid fa-right-to-bracket"></i>เข้าสู่ระบบ';
+  }
 };
-paintUser();
+async function logout() {
+  closeUserMenu();
+  try { await gasPost({ action: 'logout' }); } catch {}
+  setToken(''); setMe(null); recordPassword = '';
+  view.innerHTML = '';
+  showLogin('ออกจากระบบแล้ว');
+}
+function closeUserMenu() { $('#userMenu').hidden = true; $('#userChip').setAttribute('aria-expanded', 'false'); }
+$('#userChip').onclick = e => {
+  e.stopPropagation();
+  const m = $('#userMenu');
+  m.hidden = !m.hidden;
+  $('#userChip').setAttribute('aria-expanded', String(!m.hidden));
+};
+$('#umAccount').onclick = () => { closeUserMenu(); location.hash = 'account'; };
+$('#umLogout').onclick = logout;
+document.addEventListener('click', e => { if (!e.target.closest('.user-wrap')) closeUserMenu(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeUserMenu(); });
+/* เริ่มต้น: มี token → ตรวจกับเซิร์ฟเวอร์ (me) / ไม่มี → แสดงหน้าเข้าสู่ระบบ */
+async function start() {
+  if (!API_URL) return showLogin(NO_API_MSG);
+  if (!authToken) return showLogin();
+  try {
+    const r = await gasGet('me');
+    setMe(r.user); hideLogin(); route();
+  } catch (e) {
+    if (e.code !== 'AUTH') showLogin(e.message);
+  }
+}
 
 /* ================= ROUTER ================= */
 async function route() {
+  if (!authToken || !S.me) return; // ยังไม่เข้าสู่ระบบ: หน้าเข้าสู่ระบบแสดงอยู่
   const page = (location.hash.slice(1) || 'dashboard').split('?')[0];
   const p = PAGES[page] ? page : 'dashboard';
   $$('.nav a').forEach(a => a.classList.toggle('active', a.dataset.page === p));
@@ -326,8 +386,9 @@ async function route() {
   try {
     await boot();
     updateBadge();
-    await ({ dashboard, logs, receive: () => txForm('receive'), issue: () => txForm('issue'), return: () => txForm('return'), damage: () => txForm('damage'), repair, stock, history, settings })[p]();
+    await ({ dashboard, logs, receive: () => txForm('receive'), issue: () => txForm('issue'), return: () => txForm('return'), damage: () => txForm('damage'), repair, stock, history, settings, account })[p]();
   } catch (e) {
+    if (e.code === 'AUTH') { view.innerHTML = ''; return; }
     view.innerHTML = `<div class="card empty"><i class="fa-solid fa-plug-circle-xmark"></i>${esc(e.message)}</div>`;
   }
 }
@@ -365,7 +426,7 @@ async function dashboard() {
   <div class="reset-topbar"><button class="btn btn-bad" id="resetBtn">🗑 รีเซ็ตข้อมูล / Reset data</button></div>
   <div class="hero">
     <div class="leafs">${[12, 30, 48, 66, 84].map((l, i) => `<i class="fa-solid fa-leaf" style="left:${l}%;bottom:-20px;font-size:${18 + i * 6}px;animation-delay:${-i * 2.6}s"></i>`).join('')}</div>
-    <div class="greet"><i class="fa-solid ${greet[1]}"></i>${greet[0]}${S.user ? ' คุณ' + esc(S.user) : ''} · ${new Date().toLocaleDateString('th-TH', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}</div>
+    <div class="greet"><i class="fa-solid ${greet[1]}"></i>${greet[0]}${S.me ? ' คุณ' + esc(S.me.fullname || S.me.username) : ''} · ${new Date().toLocaleDateString('th-TH', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}</div>
     <h2><span class="t-rm">RM</span> + <span class="t-pk">PK</span> + <span class="t-fg">FG</span> ระบบบริหารพาเลท</h2>
     <p>รับเข้า · เบิกจ่าย · ซ่อม · คงเหลือ</p>
     <div class="hero-stats">
@@ -473,7 +534,7 @@ function tlItem(m) {
   return `<div class="tl act-${m.action}">
     <div class="ai"><i class="fa-solid ${a.icon}"></i></div>
     <div><b>${a.name}</b> <span class="tag" style="--c:${m.color}">${esc(m.code)} · ${esc(m.size)}</span>
-      <div class="meta">${dtTH(m.moved_at)}${m.department ? ' · ' + esc(m.department) : ''}${m.person ? ' · ' + esc(m.person) : ''}</div></div>
+      <div class="meta">${dtTH(m.moved_at)}${m.department ? ' · ' + esc(m.department) : ''}${m.actor || m.person ? ' · <i class="fa-regular fa-user"></i> ' + esc(m.actor || m.person) : ''}</div></div>
     <div class="q">${m.action === 'issue' ? '−' : m.action === 'receive' ? '+' : ''}${fmt(m.qty)}</div>
   </div>`;
 }
@@ -545,7 +606,11 @@ function drawDashCharts(d) {
 /* ================= AUDIT LOG ================= */
 const LOGCAT = {
   pallet: ['รายการพาเลท', 'fa-pallet'], repair: ['งานซ่อม', 'fa-screwdriver-wrench'],
-  setting: ['ตั้งค่าระบบ', 'fa-gear'], warn: ['ถูกปฏิเสธ', 'fa-ban'],
+  setting: ['ตั้งค่าระบบ', 'fa-gear'], warn: ['ถูกปฏิเสธ', 'fa-ban'], account: ['บัญชีผู้ใช้', 'fa-user-shield'],
+};
+const LOGACT = {
+  login: 'fa-right-to-bracket', logout: 'fa-right-from-bracket', login_failed: 'fa-user-lock', change_password: 'fa-key',
+  user_create: 'fa-user-plus', user_update: 'fa-user-pen', user_reset_password: 'fa-key', user_toggle: 'fa-user-slash',
 };
 async function logs() {
   const n = nowParts();
@@ -556,7 +621,7 @@ async function logs() {
       <div class="filters">
         <div class="field"><label>ตั้งแต่วันที่</label><input type="date" id="lFrom" value="${n.date.slice(0, 8)}01"></div>
         <div class="field"><label>ถึงวันที่</label><input type="date" id="lTo" value="${n.date}"></div>
-        <div class="field" style="flex:1;min-width:220px"><label>ค้นหา</label><input id="lQ" placeholder="เลขที่เอกสาร / ชื่อผู้ทำรายการ / ฝ่าย / รายละเอียด"></div>
+        <div class="field" style="flex:1;min-width:220px"><label>ค้นหา</label><input id="lQ" placeholder="เลขที่เอกสาร / ผู้ทำรายการ / ชื่อผู้ใช้ / ฝ่าย / รายละเอียด"></div>
         <button class="btn btn-primary" id="lGo"><i class="fa-solid fa-magnifying-glass"></i>ค้นหา</button>
         <button class="btn btn-ok" id="lCsv"><i class="fa-solid fa-file-excel"></i>Excel</button>
       </div>
@@ -567,7 +632,7 @@ async function logs() {
     $('#lRes').innerHTML = '<div class="spinner"></div>';
     const { items } = await api('logs', null, params(false));
     const cnt = k => items.filter(i => i.category === k).length;
-    $('#logKpi').innerHTML = [['', 'ทั้งหมด', 'fa-list', '#1d1d1f', items.length], ...Object.entries(LOGCAT).map(([k, [nm, ic]]) => [k, nm, ic, { pallet: '#0ea5e9', repair: '#7a5af8', setting: '#1d1d1f', warn: '#f79009' }[k], cnt(k)])]
+    $('#logKpi').innerHTML = [['', 'ทั้งหมด', 'fa-list', '#1d1d1f', items.length], ...Object.entries(LOGCAT).map(([k, [nm, ic]]) => [k, nm, ic, { pallet: '#0ea5e9', repair: '#7a5af8', setting: '#1d1d1f', warn: '#f79009', account: '#E2231A' }[k], cnt(k)])]
       .map(([k, nm, ic, c, v]) => `<div class="lk ${k === cat ? 'on' : ''}" data-cat="${k}" style="--c:${c}"><b>${fmt(v)}</b><span><i class="fa-solid ${ic}"></i>${nm}</span></div>`).join('');
     const list = cat ? items.filter(i => i.category === cat) : items;
     if (!list.length) { $('#lRes').innerHTML = '<div class="empty"><i class="fa-solid fa-clipboard"></i>ไม่พบบันทึกประวัติตามเงื่อนไข</div>'; return; }
@@ -579,10 +644,10 @@ async function logs() {
         <div class="logline">${arr.map(i => {
           const ac = ACTIONS[i.action], cc = LOGCAT[i.category] || ['', 'fa-circle'];
           return `<div class="logitem cat-${i.category}" style="animation-delay:${Math.min(k++, 20) * .03}s">
-            <div class="ai"><i class="fa-solid ${ac?.icon || cc[1]}"></i></div>
+            <div class="ai"><i class="fa-solid ${ac?.icon || LOGACT[i.action] || cc[1]}"></i></div>
             <div class="tx"><p>${esc(i.detail)}</p>
               <div class="mt2"><span><i class="fa-solid fa-tag"></i> ${cc[0]}</span>${i.ref ? `<span><i class="fa-solid fa-hashtag"></i> ${esc(i.ref)}</span>` : ''}
-              <span><i class="fa-regular fa-user"></i> ${esc(i.actor || 'ไม่ระบุ')}</span><span><i class="fa-solid fa-network-wired"></i> ${esc(i.ip)}</span></div></div>
+              <span class="by" title="ผู้ทำรายการ / By"><i class="fa-solid fa-user-check"></i> ผู้ทำรายการ / By: <b>${i.actor ? esc(i.actor) : i.username ? esc(i.username) + ' <span class="legacy">(ยังไม่เข้าสู่ระบบ)</span>' : '<span class="legacy">ไม่ระบุ (ข้อมูลเดิม)</span>'}</b></span><span><i class="fa-solid fa-network-wired"></i> ${esc(i.ip)}</span></div></div>
             <div class="tm">${i.created_at.slice(11, 16)} น.</div></div>`;
         }).join('')}</div></div>`).join('');
   };
@@ -594,6 +659,8 @@ async function logs() {
 }
 
 /* ================= TRANSACTION FORMS ================= */
+// ชื่อที่เซิร์ฟเวอร์จะบันทึกเป็นผู้ทำรายการ: "ชื่อ (username)"
+const meLabel = () => S.me ? (S.me.fullname ? `${S.me.fullname} (${S.me.username})` : S.me.username) : '';
 const TX = {
   receive: { from: null, to: 'available', btn: 'btn-ok', icon: 'fa-truck-ramp-box', label: 'บันทึกรับเข้า', color: '#12b76a' },
   issue:   { from: 'available', to: 'issued', btn: 'btn-primary', icon: 'fa-dolly', label: 'ยืนยันเบิกจ่าย', color: '#0ea5e9', dept: true },
@@ -624,7 +691,7 @@ function txForm(kind) {
         <div class="fields">
           <div class="field"><label><i class="fa-regular fa-calendar"></i> วันที่</label><input type="date" id="fDate" value="${f.date}"></div>
           <div class="field"><label><i class="fa-regular fa-clock"></i> เวลา</label><input type="time" id="fTime" value="${f.time}"></div>
-          <div class="field"><label><i class="fa-regular fa-user"></i> ${kind === 'issue' ? 'ผู้เบิก' : kind === 'receive' ? 'ผู้รับเข้า' : 'ผู้บันทึก'}</label><input id="fPerson" placeholder="ชื่อ-นามสกุล" value="${esc(S.user)}"></div>
+          <div class="field"><label><i class="fa-regular fa-user"></i> ${kind === 'issue' ? 'ชื่อผู้มาเบิก' : kind === 'receive' ? 'ชื่อผู้ส่ง / ผู้รับเข้า' : 'ชื่อผู้นำมาคืน / ผู้พบ'} (ไม่บังคับ)</label><input id="fPerson" placeholder="บันทึกเพิ่มเติมได้"></div>
           ${kind === 'damage' || kind === 'return' ? `<div class="field" id="causeBox" ${kind === 'return' ? 'hidden' : ''}><label><i class="fa-solid fa-heart-crack"></i> สาเหตุการชำรุด</label>
             <input id="fCause" list="causes" placeholder="เช่น ไม้หัก, ตะปูหลุด"><datalist id="causes"><option>ไม้หน้าพาเลทหัก</option><option>ไม้รองหัก</option><option>ตะปูหลุด/โผล่</option><option>ลูกบล็อกแตก</option><option>พลาสติกแตกร้าว</option><option>โดนรถโฟล์คลิฟท์ชน</option></datalist></div>` : ''}
           <div class="field full"><label><i class="fa-regular fa-note-sticky"></i> หมายเหตุ</label><input id="fNote" placeholder="${kind === 'receive' ? 'เช่น ซัพพลายเออร์ / เลขที่ใบส่งของ' : 'ไม่บังคับ'}"></div>
@@ -671,6 +738,7 @@ function txForm(kind) {
     if (kind !== 'receive' && t && f.size) rows.push([kind === 'return' ? 'ฝ่ายถืออยู่' : 'คงเหลือพร้อมใช้', `${fmt(maxQty())} → <b style="color:${f.qty > maxQty() ? 'var(--bad)' : 'var(--ok)'}">${fmt(maxQty() - f.qty)}</b>`]);
     else if (kind === 'receive' && t && f.size) rows.push(['พร้อมใช้หลังรับ', `${fmt(q(t.id, f.size, 'available'))} → <b style="color:var(--ok)">${fmt(q(t.id, f.size, 'available') + f.qty)}</b>`]);
     rows.push(['วันที่ / เวลา', `${$('#fDate').value ? new Date($('#fDate').value).toLocaleDateString('th-TH', { day: 'numeric', month: 'short', year: 'numeric' }) : '—'} ${$('#fTime').value} น.`]);
+    rows.push(['ผู้ทำรายการ', `<i class="fa-solid fa-user-check" style="color:var(--ok)"></i> ${esc(meLabel())}`]);
     $('#sRows').innerHTML = rows.map(([a, b]) => `<div class="srow"><span>${a}</span><b>${b}</b></div>`).join('');
     const miss = [cfg.dept && !f.department && 'ฝ่าย', !t && 'ประเภท', !f.size && 'ขนาด'].filter(Boolean);
     const over = kind !== 'receive' && t && f.size && f.qty > maxQty();
@@ -708,7 +776,8 @@ function txForm(kind) {
           ${f.department ? `<div class="srow"><span>ฝ่าย</span><b>${esc(f.department)}</b></div>` : ''}
           <div class="srow"><span>พาเลท</span><b>${esc(t.code)} · ${f.size} ม.</b></div>
           <div class="srow"><span>จำนวน</span><b>${fmt(f.qty)} ตัว</b></div>
-          <div class="srow"><span>วันที่ / เวลา</span><b>${dtTH($('#fDate').value + ' ' + $('#fTime').value)}</b></div></div>
+          <div class="srow"><span>วันที่ / เวลา</span><b>${dtTH($('#fDate').value + ' ' + $('#fTime').value)}</b></div>
+          <div class="srow"><span>ผู้ทำรายการ</span><b>${esc(meLabel())}</b></div></div>
         <div class="modal-acts"><button class="btn btn-ghost" data-close onclick="location.hash='dashboard'"><i class="fa-solid fa-gauge-high"></i>แดชบอร์ด</button>
         <button class="btn btn-primary" data-close><i class="fa-solid fa-plus"></i>ทำรายการต่อ</button></div>`);
       // ปิดหน้าต่างด้วยวิธีใดก็ตาม → โหลดฟอร์มใหม่ (ยอดคงเหลือ + วันเวลาปัจจุบัน)
@@ -758,6 +827,7 @@ function repairCard(r, i) {
     <div class="tc"><i class="fa-regular fa-clock"></i> แจ้ง ${dtTH(r.reported_at)}${r.reported_by ? ' · ' + esc(r.reported_by) : ''}</div>
     ${r.started_at ? `<div class="tc"><i class="fa-solid fa-wrench"></i> เริ่มซ่อม ${dtTH(r.started_at)}${r.repairer ? ' · ' + esc(r.repairer) : ''}</div>` : ''}
     ${r.finished_at ? `<div class="tc"><i class="fa-solid fa-flag-checkered"></i> ${r.stage === 'scrapped' ? 'ตัดจำหน่าย' : 'ซ่อมเสร็จ'} ${dtTH(r.finished_at)}</div>` : ''}
+    ${r.updated_by ? `<div class="tc"><i class="fa-solid fa-user-check"></i> อัปเดตล่าสุดโดย ${esc(r.updated_by)}</div>` : ''}
     <div class="acts">
       ${r.stage === 'damaged' ? `<button class="btn btn-sm btn-fix" data-rp="repair_start" data-id="${r.id}"><i class="fa-solid fa-screwdriver-wrench"></i>ส่งซ่อม</button>` : ''}
       ${r.stage === 'repairing' ? `<button class="btn btn-sm btn-ok" data-rp="repair_done" data-id="${r.id}"><i class="fa-solid fa-circle-check"></i>ซ่อมเสร็จ</button>` : ''}
@@ -769,9 +839,9 @@ function repairCard(r, i) {
 }
 function repairAction(r, act) {
   const meta = {
-    repair_start: ['ส่งซ่อม', 'fa-screwdriver-wrench', 'btn-fix', 'ช่างผู้ซ่อม', 'ชำรุด → กำลังซ่อม'],
-    repair_done: ['ยืนยันซ่อมเสร็จ', 'fa-circle-check', 'btn-ok', 'ผู้ตรวจรับ', 'กำลังซ่อม → พร้อมใช้'],
-    scrap: ['ตัดจำหน่าย (ซ่อมไม่ได้)', 'fa-trash-can', 'btn-bad', 'ผู้อนุมัติ', 'ออกจากระบบ'],
+    repair_start: ['ส่งซ่อม', 'fa-screwdriver-wrench', 'btn-fix', 'ช่างผู้ซ่อม (ไม่ระบุ = ชื่อบัญชีของคุณ)', 'ชำรุด → กำลังซ่อม'],
+    repair_done: ['ยืนยันซ่อมเสร็จ', 'fa-circle-check', 'btn-ok', 'ชื่อผู้ตรวจรับ (ไม่บังคับ)', 'กำลังซ่อม → พร้อมใช้'],
+    scrap: ['ตัดจำหน่าย (ซ่อมไม่ได้)', 'fa-trash-can', 'btn-bad', 'ชื่อผู้อนุมัติ (ไม่บังคับ)', 'ออกจากระบบ'],
   }[act];
   const n = nowParts();
   const m = modal(`<h3><i class="fa-solid ${meta[1]}"></i> ${meta[0]}</h3>
@@ -780,9 +850,10 @@ function repairAction(r, act) {
     <div class="fields mt">
       <div class="field"><label>วันที่</label><input type="date" id="mDate" value="${n.date}"></div>
       <div class="field"><label>เวลา</label><input type="time" id="mTime" value="${n.time}"></div>
-      <div class="field full"><label>${meta[3]}</label><input id="mPerson" value="${act === 'repair_done' ? esc(r.repairer || S.user) : esc(S.user)}"></div>
+      <div class="field full"><label>${meta[3]}</label><input id="mPerson" value="${act === 'repair_done' ? esc(r.repairer || '') : ''}"></div>
       <div class="field full"><label>หมายเหตุ</label><input id="mNote"></div>
     </div>
+    <p class="hint" style="font-size:12.5px;margin-top:10px"><i class="fa-solid fa-user-check" style="color:var(--ok)"></i> ผู้ทำรายการ: <b>${esc(meLabel())}</b> (บันทึกจากบัญชีที่เข้าสู่ระบบ)</p>
     <div class="modal-acts"><button class="btn btn-ghost" data-close>ยกเลิก</button><button class="btn ${meta[2]}" id="mGo"><i class="fa-solid ${meta[1]}"></i>${meta[0]}</button></div>`);
   $('#mGo', m).onclick = async () => {
     try {
@@ -852,7 +923,7 @@ async function history() {
       <div class="field"><label>ประเภท</label><select id="hType"><option value="">ทั้งหมด</option>${S.types.map(t => `<option value="${t.id}">${esc(t.code)} ${esc(t.name)}</option>`).join('')}</select></div>
       <div class="field"><label>รายการ</label><select id="hAct"><option value="">ทั้งหมด</option>${Object.entries(ACTIONS).map(([k, a]) => `<option value="${k}">${a.name}</option>`).join('')}</select></div>
       <div class="field"><label>ฝ่าย</label><select id="hDept"><option value="">ทั้งหมด</option>${S.depts.map(d => `<option>${esc(d.name)}</option>`).join('')}</select></div>
-      <div class="field"><label>ค้นหา</label><input id="hQ" placeholder="เลขที่ / ชื่อ / หมายเหตุ"></div>
+      <div class="field"><label>ค้นหา</label><input id="hQ" placeholder="เลขที่ / ผู้ทำรายการ / ชื่อ / หมายเหตุ"></div>
       <button class="btn btn-primary" id="hGo"><i class="fa-solid fa-magnifying-glass"></i>ค้นหา</button>
       <button class="btn btn-ok" id="hCsv"><i class="fa-solid fa-file-excel"></i>Excel</button>
     </div>
@@ -865,12 +936,13 @@ async function history() {
     const tot = k => items.filter(i => i.action === k).reduce((a, i) => a + +i.qty, 0);
     $('#hRes').innerHTML = items.length ? `
       <div class="chips" style="margin-bottom:12px">${['receive', 'issue', 'return', 'damage', 'repair_done', 'scrap'].map(k => `<span class="tag act-${k}"><i class="fa-solid ${ACTIONS[k].icon}"></i>${ACTIONS[k].name} ${fmt(tot(k))}</span>`).join('')}</div>
-      <div class="tbl-wrap" style="max-height:62vh"><table><thead><tr><th>เลขที่เอกสาร</th><th>วันที่ / เวลา</th><th>รายการ</th><th>พาเลท</th><th>ขนาด</th><th class="num">จำนวน</th><th>สถานะ</th><th>ฝ่าย</th><th>ผู้ทำรายการ</th><th>หมายเหตุ</th><th>จัดการ</th></tr></thead><tbody>
+      <div class="tbl-wrap" style="max-height:62vh"><table><thead><tr><th>เลขที่เอกสาร</th><th>วันที่ / เวลา</th><th>รายการ</th><th>พาเลท</th><th>ขนาด</th><th class="num">จำนวน</th><th>สถานะ</th><th>ฝ่าย</th><th>ผู้ทำรายการ / By</th><th>ชื่อที่ระบุ</th><th>หมายเหตุ</th><th>จัดการ</th></tr></thead><tbody>
       ${items.map(m => `<tr><td><b>${esc(m.doc_no)}</b></td><td>${dtTH(m.moved_at)}</td>
         <td><span class="tag act-${m.action}"><i class="fa-solid ${ACTIONS[m.action]?.icon}"></i>${ACTIONS[m.action]?.name || m.action}</span></td>
         <td><span class="tcode" style="--c:${m.color}"><span class="sw"></span>${esc(m.code)}</span></td><td>${esc(m.size)}</td><td class="num"><b>${fmt(m.qty)}</b></td>
         <td style="font-size:12.5px">${m.from_status ? STATUS[m.from_status].name : 'ภายนอก'} <i class="fa-solid fa-arrow-right" style="color:var(--muted);font-size:10px"></i> <b style="color:${STATUS[m.to_status]?.c}">${STATUS[m.to_status]?.name || ''}</b></td>
-        <td>${esc(m.department || '—')}</td><td>${esc(m.person || '—')}</td><td style="max-width:240px;overflow:hidden;text-overflow:ellipsis">${esc(m.note || '')}</td>
+        <td>${esc(m.department || '—')}</td>
+        <td class="by-cell">${m.actor ? `<i class="fa-solid fa-user-check" style="color:var(--ok)"></i> ${esc(m.actor)}` : '<span class="legacy" title="บันทึกก่อนมีระบบเข้าสู่ระบบ">— ข้อมูลเดิม</span>'}</td><td>${esc(m.person || '—')}</td><td style="max-width:240px;overflow:hidden;text-overflow:ellipsis">${esc(m.note || '')}</td>
         <td><div class="rec-acts"><button class="btn btn-sm btn-ghost rec-btn" data-medit="${m.id}" title="แก้ไขรายการ">✏️ แก้ไข</button><button class="btn btn-sm btn-ghost rec-btn" data-mdel="${m.id}" title="${m.repair_id ? 'ลบทั้งชุดงานซ่อม' : 'ลบรายการ'}">🗑 ลบ</button></div></td></tr>`).join('')}
       </tbody></table></div>` : '<div class="empty"><i class="fa-solid fa-magnifying-glass"></i>ไม่พบรายการตามเงื่อนไข</div>';
   };
@@ -918,13 +990,14 @@ function editMovement(m) {
       <span class="tcode" style="--c:${m.color}"><span class="sw"></span>${esc(m.code)}</span> ${esc(m.size)} ม. ·
       ${m.from_status ? STATUS[m.from_status].name : 'ภายนอก'} → ${STATUS[m.to_status]?.name || ''}</p>
     <p class="hint" style="font-size:12.5px"><i class="fa-solid fa-circle-info"></i> เปลี่ยนรายการ / ประเภท / ขนาด / สถานะไม่ได้ — หากต้องการเปลี่ยน ให้ลบรายการนี้แล้วบันทึกใหม่</p>
+    <p class="hint" style="font-size:12.5px"><i class="fa-solid fa-user-check" style="color:var(--ok)"></i> บันทึกโดย: <b>${esc(m.actor || 'ข้อมูลเดิม (ไม่ระบุ)')}</b> · การแก้ไขนี้จะบันทึกใน Log ในนาม <b>${esc(meLabel())}</b></p>
     ${chain ? `<p class="hint" style="font-size:12.5px;color:#7a5af8"><i class="fa-solid fa-link"></i> รายการนี้อยู่ในงานซ่อม <b>${esc(m.ticket_no || '')}</b> — แก้จำนวนจะปรับทุกรายการของใบนี้และใบแจ้งซ่อมพร้อมกัน · วันที่ต้องเรียง แจ้งชำรุด → ส่งซ่อม → ซ่อมเสร็จ/ตัดจำหน่าย</p>` : ''}
     <div class="fields mt">
       <div class="field"><label>จำนวน (ตัว)</label><input type="number" id="eQty" min="1" value="${+m.qty}"></div>
       ${deptEditable(m) ? `<div class="field"><label>ฝ่าย</label><select id="eDept">${depts.map(d => `<option ${d === m.department ? 'selected' : ''}>${esc(d)}</option>`).join('')}</select></div>` : '<div class="field"></div>'}
       <div class="field"><label>วันที่</label><input type="date" id="eDate" value="${m.moved_at.slice(0, 10)}"></div>
       <div class="field"><label>เวลา</label><input type="time" id="eTime" value="${m.moved_at.slice(11, 16)}"></div>
-      <div class="field full"><label>ผู้ทำรายการ</label><input id="ePerson" value="${esc(m.person)}"></div>
+      <div class="field full"><label>ชื่อที่ระบุ (ไม่บังคับ)</label><input id="ePerson" value="${esc(m.person)}"></div>
       <div class="field full"><label>หมายเหตุ</label><input id="eNote" value="${esc(m.note)}"></div>
     </div>`, f => {
     const body = { id: m.id, doc_no: m.doc_no, qty: $('#eQty', f).value, date: $('#eDate', f).value, time: $('#eTime', f).value, person: $('#ePerson', f).value, note: $('#eNote', f).value };
@@ -957,12 +1030,12 @@ function editRepair(r) {
   recordForm(`<h3><i class="fa-solid fa-pen-to-square" style="color:var(--brand)"></i> แก้ไขใบแจ้งซ่อม ${esc(r.ticket_no)}</h3>
     <p style="color:var(--muted)">${esc(r.code)} · ${esc(r.size)} ม. · ${fmt(r.qty)} ตัว${r.department ? ' · ' + esc(r.department) : ''}</p>
     <p class="hint" style="font-size:12.5px"><i class="fa-solid fa-circle-info"></i> แก้ได้เฉพาะข้อความ — จำนวน / วันที่ แก้ที่รายการแจ้งชำรุดในหน้าประวัติเคลื่อนไหว (ปรับทั้งชุด) · สถานะเปลี่ยนด้วยปุ่มส่งซ่อม / ซ่อมเสร็จ</p>
+    <p class="hint" style="font-size:12.5px"><i class="fa-solid fa-user-check" style="color:var(--ok)"></i> ผู้แจ้ง: <b>${esc(r.reported_by || 'ไม่ระบุ')}</b> (บันทึกจากบัญชีผู้ใช้ แก้ไขไม่ได้)</p>
     <div class="fields mt">
       <div class="field full"><label>สาเหตุการชำรุด</label><input id="eCause" value="${esc(r.cause)}"></div>
-      <div class="field"><label>ผู้แจ้ง</label><input id="eRep" value="${esc(r.reported_by)}"></div>
-      <div class="field"><label>ช่างผู้ซ่อม</label><input id="eFix" value="${esc(r.repairer)}"></div>
+      <div class="field full"><label>ช่างผู้ซ่อม</label><input id="eFix" value="${esc(r.repairer)}"></div>
       <div class="field full"><label>หมายเหตุ</label><textarea id="eNote" rows="3">${esc(r.note)}</textarea></div>
-    </div>`, f => recordApi('repair_update', { id: r.id, ticket_no: r.ticket_no, cause: $('#eCause', f).value, reported_by: $('#eRep', f).value, repairer: $('#eFix', f).value, note: $('#eNote', f).value }));
+    </div>`, f => recordApi('repair_update', { id: r.id, ticket_no: r.ticket_no, cause: $('#eCause', f).value, repairer: $('#eFix', f).value, note: $('#eNote', f).value }));
 }
 async function deleteRepair(r) {
   const msg = [
@@ -1009,6 +1082,149 @@ async function settings() {
   };
 }
 
+/* ================= ACCOUNT (ตั้งค่าบัญชี) =================
+   ทุกคน: ดูบัญชีของตนเอง + เปลี่ยนรหัสผ่าน · ผู้ดูแลระบบ: จัดการบัญชีผู้ใช้ทั้งหมด (เซิร์ฟเวอร์ตรวจสิทธิ์อีกชั้น) */
+const dtOrDash = s => s ? dtTH(s) : '—';
+async function account() {
+  const { user } = await api('me');
+  setMe(user);
+  const me = S.me, admin = isAdmin();
+  view.innerHTML = `<div class="grid g-2">
+    <div class="card"><h3><i class="fa-solid fa-id-badge"></i>บัญชีของฉัน</h3>
+      <div class="srow"><span>ชื่อผู้ใช้</span><b>${esc(me.username)}</b></div>
+      <div class="srow"><span>ชื่อ - นามสกุล</span><b>${esc(me.fullname)}</b></div>
+      <div class="srow"><span>สิทธิ์</span><b>${roleTag(me.role)}</b></div>
+      <div class="srow"><span>เข้าสู่ระบบล่าสุด</span><b>${dtOrDash(me.last_login)}</b></div>
+      <p class="hint" style="font-size:12.5px;margin-top:12px"><i class="fa-solid fa-circle-info"></i> ทุกรายการที่บันทึกจะแสดงผู้ทำรายการเป็น <b>${esc(meLabel())}</b></p>
+      <button class="btn btn-ghost mt" id="aLogout"><i class="fa-solid fa-right-from-bracket"></i>ออกจากระบบ</button>
+    </div>
+    <div class="card"><h3><i class="fa-solid fa-key"></i>เปลี่ยนรหัสผ่าน</h3>
+      <div class="field"><label>รหัสผ่านเดิม</label><input type="password" id="cpOld" autocomplete="current-password"></div>
+      <div class="field mt"><label>รหัสผ่านใหม่ (อย่างน้อย 8 ตัวอักษร)</label><input type="password" id="cpNew" autocomplete="new-password"></div>
+      <div class="field mt"><label>ยืนยันรหัสผ่านใหม่</label><input type="password" id="cpNew2" autocomplete="new-password"></div>
+      <div id="cpErr" style="color:var(--bad);min-height:20px;margin-top:8px;font-size:13px"></div>
+      <button class="btn btn-primary" id="cpGo" style="width:100%"><i class="fa-solid fa-floppy-disk"></i>เปลี่ยนรหัสผ่าน</button>
+      <p class="hint" style="font-size:12.5px;margin-top:10px">เปลี่ยนแล้ว เครื่องอื่นที่เข้าสู่ระบบด้วยบัญชีนี้จะถูกออกจากระบบ</p>
+    </div></div>
+    ${admin ? `<div class="card mt"><h3><i class="fa-solid fa-users-gear"></i>จัดการบัญชีผู้ใช้<span class="sub" id="uCount"></span></h3><div id="uList"><div class="spinner"></div></div></div>
+    <div class="card mt"><h3><i class="fa-solid fa-user-plus"></i>สร้างบัญชีใหม่</h3>
+      <div class="fields">
+        <div class="field"><label>ชื่อผู้ใช้ (a-z 0-9 . _ - · 3-30 ตัว)</label><input id="nuUser" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="30" placeholder="เช่น somchai"></div>
+        <div class="field"><label>ชื่อ - นามสกุล</label><input id="nuName" maxlength="100" placeholder="เช่น สมชาย ใจดี"></div>
+        <div class="field"><label>สิทธิ์</label><select id="nuRole"><option value="user">ผู้ใช้งาน</option><option value="admin">ผู้ดูแลระบบ</option></select></div>
+        <div class="field"><label>รหัสผ่านเริ่มต้น (อย่างน้อย 8 ตัวอักษร)</label><input type="password" id="nuPass" autocomplete="new-password"></div>
+      </div>
+      <div id="nuErr" style="color:var(--bad);min-height:20px;margin-top:8px;font-size:13px"></div>
+      <button class="btn btn-primary" id="nuGo"><i class="fa-solid fa-user-plus"></i>สร้างบัญชี</button>
+    </div>` : ''}`;
+
+  $('#aLogout').onclick = logout;
+  const busy = (b, on, html) => { b.disabled = on; if (html) b.innerHTML = html; };
+  $('#cpGo').onclick = async () => {
+    const b = $('#cpGo'), e = $('#cpErr'), o = $('#cpOld').value, n = $('#cpNew').value, n2 = $('#cpNew2').value;
+    e.textContent = '';
+    if (!o || !n) { e.textContent = 'กรุณากรอกรหัสผ่านเดิมและรหัสผ่านใหม่'; return; }
+    if (n.length < 8) { e.textContent = 'รหัสผ่านใหม่ต้องมีอย่างน้อย 8 ตัวอักษร'; return; }
+    if (n !== n2) { e.textContent = 'ยืนยันรหัสผ่านใหม่ไม่ตรงกัน'; return; }
+    busy(b, true, '<i class="fa-solid fa-spinner fa-spin"></i> กำลังบันทึก...');
+    try {
+      const r = await api('change_password', { old_password: o, new_password: n });
+      setToken(r.token);
+      ['#cpOld', '#cpNew', '#cpNew2'].forEach(s => $(s).value = '');
+      toast(r.message);
+    } catch (x) { e.textContent = x.message; }
+    busy(b, false, '<i class="fa-solid fa-floppy-disk"></i>เปลี่ยนรหัสผ่าน');
+  };
+  if (!admin) return;
+
+  let users = [];
+  const loadUsers = async () => {
+    const r = await api('users');
+    users = r.users;
+    $('#uCount').textContent = `${users.length} บัญชี · ใช้งาน ${users.filter(u => u.active).length}`;
+    $('#uList').innerHTML = `<div class="tbl-wrap"><table><thead><tr><th>ชื่อผู้ใช้</th><th>ชื่อ - นามสกุล</th><th>สิทธิ์</th><th>สถานะ</th><th>เข้าสู่ระบบล่าสุด</th><th>จัดการ</th></tr></thead><tbody>
+      ${users.map(u => `<tr class="${u.active ? '' : 'u-off'}"><td><b>${esc(u.username)}</b>${u.id === me.id ? ' <span class="tag" style="--c:#12b76a">คุณ</span>' : ''}</td><td>${esc(u.fullname)}</td><td>${roleTag(u.role)}</td>
+        <td>${u.active ? '<span class="tag" style="--c:#12b76a"><i class="fa-solid fa-circle-check"></i>ใช้งาน</span>' : '<span class="tag" style="--c:#667085"><i class="fa-solid fa-ban"></i>ปิดใช้งาน</span>'}</td>
+        <td style="white-space:nowrap">${dtOrDash(u.last_login)}</td>
+        <td><div class="u-acts"><button class="btn btn-sm btn-ghost rec-btn" data-uedit="${u.id}"><i class="fa-solid fa-user-pen"></i>แก้ไข</button>
+          <button class="btn btn-sm btn-ghost rec-btn" data-upw="${u.id}"><i class="fa-solid fa-key"></i>ตั้งรหัสใหม่</button>
+          <button class="btn btn-sm btn-ghost rec-btn" data-utog="${u.id}"><i class="fa-solid ${u.active ? 'fa-user-slash' : 'fa-user-check'}"></i>${u.active ? 'ปิดใช้งาน' : 'เปิดใช้งาน'}</button></div></td></tr>`).join('')}
+      </tbody></table></div>`;
+  };
+  const afterSelfChange = async () => { const r = await api('me'); setMe(r.user); if (!isAdmin()) return route(); };
+  const userForm = (html, onSave) => {
+    const m = modal(html + `<div id="uErr" style="color:var(--bad);min-height:20px;margin-top:8px;font-size:13px"></div>
+      <div class="modal-acts"><button class="btn btn-ghost" data-close>ยกเลิก</button><button class="btn btn-primary" id="uSave"><i class="fa-solid fa-floppy-disk"></i>บันทึก</button></div>`);
+    const go = $('#uSave', m);
+    go.onclick = async () => {
+      if (go.disabled) return;
+      busy(go, true, '<i class="fa-solid fa-spinner fa-spin"></i> กำลังบันทึก...');
+      try {
+        const r = await onSave(m);
+        closeModal(); toast(r.message, r.changed === false ? 'info' : 'ok');
+        await loadUsers();
+      } catch (x) {
+        if (x.code === 'AUTH') return;
+        $('#uErr', m).textContent = x.message;
+        busy(go, false, '<i class="fa-solid fa-floppy-disk"></i>บันทึก');
+      }
+    };
+    return m;
+  };
+  view.onclick = async e => {
+    const ed = e.target.closest('[data-uedit]'), pw = e.target.closest('[data-upw]'), tg = e.target.closest('[data-utog]');
+    const u = users.find(x => x.id === +(ed || pw || tg)?.dataset[ed ? 'uedit' : pw ? 'upw' : 'utog']);
+    if (!u) return;
+    if (ed) userForm(`<h3><i class="fa-solid fa-user-pen" style="color:var(--brand)"></i> แก้ไขบัญชี ${esc(u.username)}</h3>
+        <div class="field mt"><label>ชื่อ - นามสกุล</label><input id="ueName" maxlength="100" value="${esc(u.fullname)}"></div>
+        <div class="field mt"><label>สิทธิ์</label><select id="ueRole"><option value="user" ${u.role === 'user' ? 'selected' : ''}>ผู้ใช้งาน</option><option value="admin" ${u.role === 'admin' ? 'selected' : ''}>ผู้ดูแลระบบ</option></select></div>
+        <div class="field mt"><label>สถานะ</label><select id="ueActive"><option value="1" ${u.active ? 'selected' : ''}>ใช้งาน</option><option value="0" ${u.active ? '' : 'selected'}>ปิดใช้งาน (ออกจากระบบทุกเครื่อง)</option></select></div>`,
+      async m => {
+        const r = await api('user_save', { id: u.id, fullname: $('#ueName', m).value, role: $('#ueRole', m).value, active: $('#ueActive', m).value });
+        if (u.id === me.id) await afterSelfChange();
+        return r;
+      });
+    if (pw) userForm(`<h3><i class="fa-solid fa-key" style="color:var(--brand)"></i> ตั้งรหัสผ่านใหม่ให้ ${esc(u.username)}</h3>
+        <p style="color:var(--muted)">${esc(u.fullname)} จะถูกออกจากระบบทุกเครื่อง และต้องเข้าสู่ระบบด้วยรหัสผ่านใหม่</p>
+        <div class="field mt"><label>รหัสผ่านใหม่ (อย่างน้อย 8 ตัวอักษร)</label><input type="password" id="upNew" autocomplete="new-password"></div>
+        <div class="field mt"><label>ยืนยันรหัสผ่านใหม่</label><input type="password" id="upNew2" autocomplete="new-password"></div>`,
+      async m => {
+        const n = $('#upNew', m).value;
+        if (n.length < 8) throw new Error('รหัสผ่านใหม่ต้องมีอย่างน้อย 8 ตัวอักษร');
+        if (n !== $('#upNew2', m).value) throw new Error('ยืนยันรหัสผ่านใหม่ไม่ตรงกัน');
+        const r = await api('user_reset_password', { id: u.id, password: n });
+        if (r.token) setToken(r.token); // ตั้งรหัสใหม่ให้ตัวเอง: เครื่องนี้ยังเข้าสู่ระบบอยู่
+        return r;
+      });
+    if (tg) {
+      if (!confirm(u.active ? `ปิดใช้งานบัญชี ${u.username} (${u.fullname})?\nผู้ใช้นี้จะถูกออกจากระบบทุกเครื่องและเข้าสู่ระบบไม่ได้จนกว่าจะเปิดใช้งานอีกครั้ง` : `เปิดใช้งานบัญชี ${u.username} (${u.fullname})?`)) return;
+      try {
+        const r = await api('user_toggle', { id: u.id });
+        toast(r.message, 'info');
+        if (u.id === me.id) return authLost();
+        await loadUsers();
+      } catch (x) { if (x.code !== 'AUTH') toast(x.message, 'err'); }
+    }
+  };
+  $('#nuGo').onclick = async () => {
+    const b = $('#nuGo'), e = $('#nuErr');
+    const body = { username: $('#nuUser').value.trim().toLowerCase(), fullname: $('#nuName').value.trim(), role: $('#nuRole').value, password: $('#nuPass').value };
+    e.textContent = '';
+    if (!/^[a-z0-9._-]{3,30}$/.test(body.username)) { e.textContent = 'ชื่อผู้ใช้ต้องยาว 3-30 ตัว ใช้ได้เฉพาะ a-z 0-9 . _ -'; return; }
+    if (!body.fullname) { e.textContent = 'กรุณากรอกชื่อ - นามสกุล'; return; }
+    if (body.password.length < 8) { e.textContent = 'รหัสผ่านต้องมีอย่างน้อย 8 ตัวอักษร'; return; }
+    busy(b, true, '<i class="fa-solid fa-spinner fa-spin"></i> กำลังสร้าง...');
+    try {
+      const r = await api('user_save', body);
+      toast(r.message);
+      ['#nuUser', '#nuName', '#nuPass'].forEach(s => $(s).value = '');
+      await loadUsers();
+    } catch (x) { e.textContent = x.message; }
+    busy(b, false, '<i class="fa-solid fa-user-plus"></i>สร้างบัญชี');
+  };
+  await loadUsers();
+}
+
 /* รีเซ็ตข้อมูล: ถามรหัสรีเซ็ต (ใช้ครั้งเดียว ไม่เก็บไว้) → ยืนยัน → POST reset_data */
 const RESET_CONFIRM = [
   'ยืนยันการรีเซ็ตข้อมูล?',
@@ -1024,7 +1240,7 @@ const RESET_CONFIRM = [
 ].join('\n');
 function resetData() {
   const m = modal(`<h3><i class="fa-solid fa-trash-can" style="color:var(--bad)"></i> รีเซ็ตข้อมูล / Reset data</h3>
-    <p style="color:var(--muted)">ใส่รหัสรีเซ็ตข้อมูล (ตั้งโดยผู้ดูแลระบบ — คนละรหัสกับรหัสบันทึกข้อมูล)</p>
+    <p style="color:var(--muted)">ใส่รหัสรีเซ็ตข้อมูล (ตั้งโดยผู้ดูแลระบบ — คนละรหัสกับรหัสเข้าสู่ระบบ)</p>
     <div class="field mt"><label>รหัสรีเซ็ตข้อมูล</label><input type="password" id="rPw" autocomplete="off"></div>
     <div id="rErr" style="color:var(--bad);min-height:20px;margin-top:8px;font-size:13px"></div>
     <div class="modal-acts"><button class="btn btn-ghost" data-close>ยกเลิก</button><button class="btn btn-bad" id="rGo"><i class="fa-solid fa-trash-can"></i>รีเซ็ตข้อมูล</button></div>`);
@@ -1037,7 +1253,7 @@ function resetData() {
     if (!confirm(RESET_CONFIRM)) { inp.focus(); return; }
     go.disabled = true; go.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> กำลังรีเซ็ต...'; err.textContent = '';
     try {
-      const r = await gasPost({ action: 'reset_data', resetPassword: pw, actor: S.user || '' });
+      const r = await gasPost({ action: 'reset_data', resetPassword: pw });
       pw = ''; inp.value = '';
       closeModal();
       const c = r.removed || {};
@@ -1053,4 +1269,4 @@ function resetData() {
   inp.focus();
 }
 
-route();
+start();

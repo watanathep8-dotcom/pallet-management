@@ -18,6 +18,35 @@
     .rec-acts{display:flex;gap:6px;flex-wrap:nowrap}
     .rcard .rec-acts{margin-top:6px;justify-content:flex-end}
     .rec-btn{padding:5px 10px;font-size:12px;border-radius:9px;gap:4px}
+    /* login screen */
+    .login-screen{position:fixed;inset:0;z-index:120;display:grid;place-items:center;padding:16px;overflow:auto;background:rgba(248,245,245,.78);backdrop-filter:blur(10px)}
+    .login-screen[hidden]{display:none}
+    .login-card{width:min(420px,100%);padding:28px 26px;animation:modalIn .5s cubic-bezier(.3,1.5,.5,1)}
+    .login-card .brand{box-shadow:none;padding:0;background:none}
+    .login-card h2{font-family:'Kanit';font-size:24px;margin:20px 0 2px}
+    .login-card .lg-sub{color:var(--muted);font-size:14px;margin-bottom:14px}
+    .login-err{color:var(--bad);min-height:22px;margin:10px 0 12px;font-size:13.5px;white-space:pre-line}
+    .login-wait{display:none;text-align:center;color:var(--muted)}
+    .login-wait .spinner{margin:24px auto 12px}
+    .login-screen.checking .login-wait{display:block}
+    .login-screen.checking form{display:none}
+    /* user menu (top right) */
+    .user-wrap{position:relative}
+    .user-menu{position:absolute;right:0;top:calc(100% + 8px);z-index:60;min-width:240px;background:#fff;border-radius:16px;box-shadow:0 20px 50px -15px rgba(0,0,0,.35);padding:8px;animation:fadeIn .2s}
+    .user-menu[hidden]{display:none}
+    .user-menu .um-h{padding:10px 12px 12px;border-bottom:1px solid #f1e9e9;margin-bottom:6px}
+    .user-menu .um-h b{display:block;font-family:'Kanit'}
+    .user-menu .um-h small{color:var(--muted)}
+    .user-menu button{display:flex;align-items:center;gap:10px;width:100%;padding:10px 12px;border-radius:11px;font-weight:500;text-align:left}
+    .user-menu button i{width:18px;color:var(--brand)}
+    .user-menu button:hover{background:var(--brand-soft);color:var(--brand2)}
+    /* attribution / accounts */
+    .by-cell{white-space:nowrap;font-weight:600}
+    .legacy{color:var(--muted);font-weight:400;font-size:12px}
+    .logitem .by{color:var(--ink)}
+    .logitem .by b{font-weight:600}
+    .u-off td{opacity:.55}
+    .u-acts{display:flex;gap:6px;flex-wrap:wrap}
   </style>
 </head>
 <body>
@@ -48,6 +77,7 @@
       <a href="#history" data-page="history"><i class="fa-solid fa-right-left"></i><span>ประวัติเคลื่อนไหว</span></a>
       <a href="#logs" data-page="logs"><i class="fa-solid fa-clipboard-list"></i><span>บันทึกประวัติ (Log)</span></a>
       <a href="#settings" data-page="settings"><i class="fa-solid fa-sitemap"></i><span>ตั้งค่าฝ่าย</span></a>
+      <a href="#account" data-page="account"><i class="fa-solid fa-gear"></i><span>ตั้งค่าบัญชี</span></a>
     </nav>
     <div class="side-foot">
       <div class="legend-mini">
@@ -67,13 +97,42 @@
       </div>
       <div class="top-actions">
         <div class="clock hide-sm"><i class="fa-regular fa-clock fa-spin-pulse" style="--fa-animation-duration:4s"></i><span id="clock">--:--:--</span><small id="clockDate"></small></div>
-        <button class="user-chip" id="userChip" title="ตั้งชื่อผู้ใช้งาน"><span class="av" id="userAv"><i class="fa-solid fa-user"></i></span><span class="un" id="userName">ระบุชื่อผู้ใช้</span></button>
+        <div class="user-wrap">
+          <button class="user-chip" id="userChip" title="บัญชีผู้ใช้" aria-haspopup="true" aria-expanded="false"><span class="av" id="userAv"><i class="fa-solid fa-user"></i></span><span class="un" id="userName">—</span><i class="fa-solid fa-chevron-down" style="font-size:11px;color:var(--muted)"></i></button>
+          <div class="user-menu" id="userMenu" hidden>
+            <div class="um-h"><b id="umName"></b><small id="umInfo"></small></div>
+            <button id="umAccount"><i class="fa-solid fa-gear"></i>ตั้งค่าบัญชี</button>
+            <button id="umLogout"><i class="fa-solid fa-right-from-bracket"></i>ออกจากระบบ</button>
+          </div>
+        </div>
         <a class="btn btn-primary" href="#issue"><i class="fa-solid fa-dolly"></i> <span class="hide-sm">เบิกจ่าย</span></a>
       </div>
     </header>
     <div class="cfg-banner" id="cfgBanner" hidden><i class="fa-solid fa-plug-circle-exclamation"></i><div><b>ยังไม่ได้ตั้งค่า apiUrl</b><br><small>ใส่ URL ของ Google Apps Script Web App (ลงท้ายด้วย <code>/exec</code>) ในไฟล์ <code>docs/config.js</code> แล้วโหลดหน้านี้ใหม่</small></div></div>
     <section id="view" class="view"></section>
   </main>
+
+  <!-- หน้าเข้าสู่ระบบ: ต้องเข้าสู่ระบบก่อนใช้งานทุกส่วน -->
+  <div id="loginScreen" class="login-screen checking">
+    <div class="card login-card">
+      <div class="brand">
+        <div class="brand-icon"><i class="fa-solid fa-pallet"></i></div>
+        <div>
+          <div class="brand-name">Pallet<span>Hub</span></div>
+          <div class="brand-sub">RM + PK + FG (ราชบุรี)</div>
+        </div>
+      </div>
+      <div class="login-wait"><div class="spinner"></div>กำลังตรวจสอบการเข้าสู่ระบบ...</div>
+      <form id="loginForm" autocomplete="on" novalidate>
+        <h2>เข้าสู่ระบบ</h2>
+        <p class="lg-sub">กรุณาเข้าสู่ระบบด้วยบัญชีที่ผู้ดูแลระบบสร้างให้</p>
+        <div class="field"><label for="lgUser"><i class="fa-regular fa-user"></i> ชื่อผู้ใช้</label><input id="lgUser" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="60"></div>
+        <div class="field mt"><label for="lgPass"><i class="fa-solid fa-lock"></i> รหัสผ่าน</label><input id="lgPass" name="password" type="password" autocomplete="current-password"></div>
+        <div class="login-err" id="lgErr" role="alert"></div>
+        <button class="btn btn-primary btn-lg" type="submit" id="lgBtn" style="width:100%"><i class="fa-solid fa-right-to-bracket"></i>เข้าสู่ระบบ</button>
+      </form>
+    </div>
+  </div>
 
   <div id="toasts" class="toasts"></div>
   <div id="modal" class="modal" hidden><div class="modal-card" id="modalCard"></div></div>
@@ -82,6 +141,6 @@
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
   <script src="config.js?v=1"></script>
-  <script src="assets/app.js?v=14"></script>
+  <script src="assets/app.js?v=15"></script>
 </body>
 </html>
