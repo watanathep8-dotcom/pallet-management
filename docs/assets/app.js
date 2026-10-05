@@ -1110,9 +1110,8 @@ async function account() {
     <div class="card mt"><h3><i class="fa-solid fa-user-plus"></i>สร้างบัญชีใหม่</h3>
       <div class="fields">
         <div class="field"><label>ชื่อผู้ใช้ (a-z 0-9 . _ - · 3-30 ตัว)</label><input id="nuUser" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="30" placeholder="เช่น somchai"></div>
-        <div class="field"><label>ชื่อ - นามสกุล</label><input id="nuName" maxlength="100" placeholder="เช่น สมชาย ใจดี"></div>
+        <div class="field"><label>รหัสผ่าน (อย่างน้อย 8 ตัวอักษร)</label><input type="password" id="nuPass" autocomplete="new-password"></div>
         <div class="field"><label>สิทธิ์</label><select id="nuRole"><option value="user">ผู้ใช้งาน</option><option value="admin">ผู้ดูแลระบบ</option></select></div>
-        <div class="field"><label>รหัสผ่านเริ่มต้น (อย่างน้อย 8 ตัวอักษร)</label><input type="password" id="nuPass" autocomplete="new-password"></div>
       </div>
       <div id="nuErr" style="color:var(--bad);min-height:20px;margin-top:8px;font-size:13px"></div>
       <button class="btn btn-primary" id="nuGo"><i class="fa-solid fa-user-plus"></i>สร้างบัญชี</button>
@@ -1208,16 +1207,18 @@ async function account() {
   };
   $('#nuGo').onclick = async () => {
     const b = $('#nuGo'), e = $('#nuErr');
-    const body = { username: $('#nuUser').value.trim().toLowerCase(), fullname: $('#nuName').value.trim(), role: $('#nuRole').value, password: $('#nuPass').value };
+    // The account form has only username / password / role; the username doubles
+    // as the display name (an admin can still rename it via แก้ไข).
+    const username = $('#nuUser').value.trim().toLowerCase();
+    const body = { username, fullname: username, role: $('#nuRole').value, password: $('#nuPass').value };
     e.textContent = '';
     if (!/^[a-z0-9._-]{3,30}$/.test(body.username)) { e.textContent = 'ชื่อผู้ใช้ต้องยาว 3-30 ตัว ใช้ได้เฉพาะ a-z 0-9 . _ -'; return; }
-    if (!body.fullname) { e.textContent = 'กรุณากรอกชื่อ - นามสกุล'; return; }
     if (body.password.length < 8) { e.textContent = 'รหัสผ่านต้องมีอย่างน้อย 8 ตัวอักษร'; return; }
     busy(b, true, '<i class="fa-solid fa-spinner fa-spin"></i> กำลังสร้าง...');
     try {
       const r = await api('user_save', body);
       toast(r.message);
-      ['#nuUser', '#nuName', '#nuPass'].forEach(s => $(s).value = '');
+      ['#nuUser', '#nuPass'].forEach(s => $(s).value = '');
       await loadUsers();
     } catch (x) { e.textContent = x.message; }
     busy(b, false, '<i class="fa-solid fa-user-plus"></i>สร้างบัญชี');

@@ -1455,7 +1455,7 @@ test("docs JS files parse (new Function)", () => {
   assert.ok(app.includes("resetPassword: pw }"));
   assert.ok(/data-medit=.*✏️ แก้ไข/.test(app) && /data-mdel=.*🗑 ลบ/.test(app) && /data-redit=.*data-rdel=/.test(app));
   const html = fs.readFileSync(path.join(ROOT, "docs/index.html"), "utf8");
-  assert.ok(html.includes('assets/app.js?v=15"'));
+  assert.ok(html.includes('assets/app.js?v=16"'));
   assert.ok(html.includes('id="loginScreen"') && html.includes('data-page="account"'));
   assert.ok(!/verifyPassword'|actionPassword|palletUser/.test(app)); // old shared password / typed-name features removed
   for (const a of ["login", "logout", "me", "change_password", "users", "user_save", "user_reset_password", "user_toggle"]) assert.ok(app.includes(`'${a}'`), a);
