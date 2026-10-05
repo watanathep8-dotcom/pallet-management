@@ -7,28 +7,27 @@
  * Script Properties (PALLET_SPREADSHEET_ID). Then deploy as a web app
  * (Execute as: me, Who has access: Anyone).
  *
- * Login: every action (reads and writes) needs a session token obtained from
- * the "login" action (username + password of a row in the "users" sheet).
- * The first admin: while the users sheet is empty, logging in as "admin" with
- * the password stored in Script property PALLET_INITIAL_ADMIN_PASSWORD
- * creates the admin account (the property is not used after that). Admins
- * manage the other accounts (users, user_save, user_reset_password,
- * user_toggle). The server records the logged-in user (fullname + username)
- * on every movement, repair ticket and audit_logs row.
+ * No login: reads and the normal writes (receive, issue, return, damage,
+ * repair_start, repair_done, scrap, dept_save, dept_delete) need no password.
+ * The name typed in the top-right of the page is sent as "actor" and recorded
+ * on every movement, repair ticket and audit_logs row ("ผู้ทำรายการ").
  *
- * Optional: set Script property PALLET_RESET_PASSWORD (a separate password)
- * to enable the "reset_data" action, which wipes movements, repairs and
- * audit_logs (pallet types, departments and users are kept). The same reset
- * password (and the same lockout counter) also protects editing / deleting
- * individual records: movement_update, movement_delete, repair_update,
- * repair_delete. Every edit/delete is validated by replaying all movements in
- * time order (see validateLedger_) so stock and department balances never go
- * negative.
+ * Script property PALLET_RESET_PASSWORD (a separate password) protects, with
+ * one lockout counter (10 wrong / 15 min): reset_data (wipes movements,
+ * repairs and audit_logs; pallet types and departments are kept), editing /
+ * deleting records (movement_update, movement_delete, repair_update,
+ * repair_delete) and reading the audit log (logs, logs_export). Every
+ * edit/delete is validated by replaying all movements in time order (see
+ * validateLedger_) so stock and department balances never go negative.
+ *
+ * Sheets made by the earlier login version keep working: their extra columns
+ * (movements/audit_logs "username", repairs "reported_username" /
+ * "updated_username") are left empty for new rows, and a "users" sheet is
+ * simply ignored (never read, changed or deleted).
  *
  * Transport:
- *   GET  ?action=<read action>&token=<session>&...params -> {ok:true,data} | {ok:false,error[,code]}
- *   POST text/plain JSON {action, token, ...fields}
- *   Not logged in / session expired -> {ok:false, code:"AUTH", error:"กรุณาเข้าสู่ระบบ"}
+ *   GET  ?action=<read action>&...params -> {ok:true,data} | {ok:false,error}
+ *   POST text/plain JSON {action, actor, ...fields}
  */
 
 var SPREADSHEET_ID_PROPERTY = "PALLET_SPREADSHEET_ID";
@@ -42,31 +41,16 @@ var RESET_PASSWORD_PROPERTY = "PALLET_RESET_PASSWORD";
 var RESET_FAIL_CACHE_KEY = "PALLET_RESET_FAILURES";
 var PASSWORD_MAX_FAILURES = 10;
 var PASSWORD_LOCK_SECONDS = 900;
-var RESET_TABLES = ["movements", "repairs", "audit_logs"]; // pallet_types/departments/users are kept
-// Record maintenance actions: protected by PALLET_RESET_PASSWORD (plus the session).
+var RESET_TABLES = ["movements", "repairs", "audit_logs"]; // pallet_types/departments are kept
+// Record maintenance actions: protected by PALLET_RESET_PASSWORD.
 var RECORD_ACT_NAME = {
   movement_update: "แก้ไขรายการ", movement_delete: "ลบรายการ",
   repair_update: "แก้ไขใบแจ้งซ่อม", repair_delete: "ลบใบแจ้งซ่อม"
 };
 var RESET_PASSWORD_ACTIONS = [RESET_ACTION, "movement_update", "movement_delete", "repair_update", "repair_delete"];
-
-// Accounts / sessions (same approach as work-permit Auth.gs): random salt +
-// iterated SHA-256, sessions in CacheService bound to the user's salt, so a
-// password change/reset or disabling the account ends existing sessions.
-var INITIAL_ADMIN_PASSWORD_PROPERTY = "PALLET_INITIAL_ADMIN_PASSWORD";
-var INITIAL_ADMIN_USERNAME = "admin";
-var INITIAL_ADMIN_FULLNAME = "ผู้ดูแลระบบ";
-var HASH_ROUNDS = 5000;
-var SESSION_TTL = 21600;             // 6 h (CacheService maximum)
-var SESSION_PREFIX = "PALLET_SESSION_";
-var LOGIN_FAIL_PREFIX = "PALLET_LOGIN_FAILURES_";
-var LOGIN_MAX_FAILURES = 10;
-var LOGIN_LOCK_SECONDS = 900;        // 15 min
-var PASSWORD_MIN = 8;
-var PASSWORD_MAX = 200;
-var USERNAME_RE = /^[a-z0-9._-]{3,30}$/;
-var ROLES = ["admin", "user"];
-var AUTH_MESSAGE = "กรุณาเข้าสู่ระบบ";
+// Reading the audit log also needs the reset password (POST only, so the
+// password never travels in a URL).
+var LOG_ACTIONS = ["logs", "logs_export"];
 
 // Asia/Bangkok has no daylight saving time, so a fixed +07:00 offset gives the
 // same wall-clock values as PHP's date_default_timezone_set('Asia/Bangkok').
@@ -90,29 +74,27 @@ var SCHEMA = {
     ["stage", "str"], ["source", "str"], ["department", "str?"], ["cause", "str"],
     ["reported_by", "str"], ["repairer", "str"], ["reported_at", "dt"], ["started_at", "dt?"],
     ["finished_at", "dt?"], ["note", "str"],
-    // added with login: who opened / last changed the ticket (server-side)
+    // who opened / last changed the ticket (the actor name). The *_username
+    // columns come from the former login version: kept, empty for new rows.
     ["reported_username", "str"], ["updated_by", "str"], ["updated_username", "str"], ["updated_at", "dt?"]
   ],
   movements: [
     ["id", "int"], ["doc_no", "str"], ["action", "str"], ["type_id", "int"], ["size", "str"],
     ["qty", "int"], ["from_status", "str?"], ["to_status", "str?"], ["department", "str?"],
     ["person", "str"], ["note", "str"], ["repair_id", "int?"], ["moved_at", "dt"], ["created_at", "dt"],
-    // added with login: logged-in user ("fullname (username)") — person stays an optional free-text name
+    // actor: the name typed in the page header ("ผู้ทำรายการ"); person stays an
+    // optional free-text name. username: former login version, empty for new rows.
     ["actor", "str"], ["username", "str"]
   ],
   audit_logs: [
     ["id", "int"], ["category", "str"], ["action", "str"], ["ref", "str"], ["detail", "str"],
     ["actor", "str"], ["ip", "str"], ["created_at", "dt"],
-    ["username", "str"] // added with login
-  ],
-  users: [
-    ["id", "int"], ["username", "str"], ["password_hash", "str"], ["salt", "str"], ["fullname", "str"],
-    ["role", "str"], ["active", "int"], ["created_at", "dt"], ["updated_at", "dt?"], ["last_login", "dt?"]
+    ["username", "str"] // former login version: kept, empty for new rows
   ]
 };
-var TABLE_ORDER = ["pallet_types", "departments", "repairs", "movements", "audit_logs", "users"];
-// Sheets that are created on demand when missing (spreadsheets made before they existed).
-var AUTO_CREATE_TABLES = ["users"];
+var TABLE_ORDER = ["pallet_types", "departments", "repairs", "movements", "audit_logs"];
+// Sheets that are created on demand when missing (none at the moment).
+var AUTO_CREATE_TABLES = [];
 
 var SEED_TYPES = [
   ["RM", "RM", "พาเลทสำหรับใส่ RM", "วัตถุดิบ (RM)", "วัตถุดิบ", "#1E6FE0", "1.2x1.2", 1],
@@ -144,14 +126,32 @@ var STATUS_NAME = {
 };
 var LOG_CAT_NAME = { pallet: "รายการพาเลท", repair: "งานซ่อม", setting: "ตั้งค่า", warn: "ถูกปฏิเสธ", account: "บัญชีผู้ใช้" };
 
-var READ_ACTIONS = ["bootstrap", "dashboard", "repairs", "history", "export", "logs", "logs_export", "me", "users"];
+var READ_ACTIONS = ["bootstrap", "dashboard", "repairs", "history", "export", "logs", "logs_export", "batch"];
+// "batch" runs several of these reads in one request: reads=[{action, ...params}, ...]
+// -> {results:[data, ...]} (same data as the single actions). Writes
+// accept the same optional "reads" list and return the results (computed after
+// the write) as data.reads, so the page can be redrawn without another request.
+var BATCH_ACTIONS = ["bootstrap", "dashboard", "repairs", "history"];
+var BATCH_MAX = 6;
+
+/* Read cache (CacheService): rows of the data sheets and the derived bootstrap
+ * data are cached for read requests, keyed by a per-sheet "data version". Every
+ * write bumps the version of each sheet it changed right after the changes are
+ * flushed (see flush_), so a cached copy is never used after a write through
+ * this API. Readers take the versions BEFORE reading a sheet, so a copy stored
+ * under a version always contains every write made before that version was
+ * set. Writes always read the sheets live under the script lock.
+ * Edits made by hand in the spreadsheet show up after READ_CACHE_TTL seconds,
+ * or at once after running clearReadCache() from the Apps Script editor. */
+var CACHED_TABLES = ["pallet_types", "departments", "repairs", "movements", "audit_logs"];
+var VERSION_PREFIX = "PALLET_V_";
+var VERSION_TTL = 21600;
+var RC_PREFIX = "PALLET_RC_";
+var READ_CACHE_TTL = 600;
+var RC_CHUNK = 30000;      // characters per cache value (<= 100 KB even for 3-byte UTF-8 text)
+var RC_MAX_CHUNKS = 30;    // bigger sheets are simply not cached
 var WRITE_ACTIONS = ["receive", "issue", "return", "damage", "repair_start", "repair_done", "scrap", "dept_save", "dept_delete"];
-// Account actions that write (POST, session required, run under the script lock).
-var ACCOUNT_ACTIONS = ["logout", "change_password", "user_save", "user_reset_password", "user_toggle"];
-// The audit log (who did what) is visible to administrators only.
-var ADMIN_ACTIONS = ["users", "user_save", "user_reset_password", "user_toggle", "logs", "logs_export"];
-var POST_ONLY_ACTIONS = ["login", "verifyResetPassword"]
-  .concat(WRITE_ACTIONS, RESET_PASSWORD_ACTIONS, ACCOUNT_ACTIONS);
+var POST_ONLY_ACTIONS = ["verifyResetPassword"].concat(WRITE_ACTIONS, RESET_PASSWORD_ACTIONS, LOG_ACTIONS);
 
 // Length limits of the MySQL VARCHAR columns that store user text.
 var MAX_PERSON = 100;
@@ -167,9 +167,8 @@ function doGet(e) {
     if (!action) return jsonResponse_({ ok: true, data: { service: "Pallet Hub API" } });
     if (POST_ONLY_ACTIONS.indexOf(action) !== -1) throw new Error("คำสั่งนี้ต้องส่งแบบ POST");
     if (READ_ACTIONS.indexOf(action) === -1) fail_("Unknown action");
-    resetRequest_(null);
-    authenticate_(params.token, action);
-    return jsonResponse_({ ok: true, data: handleRead_(action, params) });
+    resetRequest_("");
+    return jsonResponse_({ ok: true, data: runRead_(action, params) });
   } catch (error) {
     return errorResponse_(error);
   }
@@ -185,49 +184,59 @@ function doPost(e) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) payload = {};
   var action = String(payload.action || "");
 
-  var user;
+  var reads = null;
   try {
-    if (action === "login") return jsonResponse_({ ok: true, data: actionLogin_(payload) });
-    if (POST_ONLY_ACTIONS.indexOf(action) === -1 && READ_ACTIONS.indexOf(action) === -1) fail_("Unknown action");
-    resetRequest_(null);
-    // Session first: nothing below (including the reset-password check and its
-    // lockout counter) is reachable without being logged in.
-    user = authenticate_(payload.token, action);
-    if (READ_ACTIONS.indexOf(action) !== -1) {
-      return jsonResponse_({ ok: true, data: handleRead_(action, payload) });
-    }
     if (action === "verifyResetPassword") {
       return jsonResponse_({ ok: true, data: verifyResetPassword(payload.resetPassword) });
     }
-    // reset_data and record edits/deletes additionally need the reset password.
-    // Checked before taking the lock so guessing (1 s delay) never blocks writers.
+    if (READ_ACTIONS.indexOf(action) !== -1) {
+      // The audit log is behind the reset password (same lockout counter).
+      if (LOG_ACTIONS.indexOf(action) !== -1) assertResetPassword_(payload.resetPassword);
+      resetRequest_("");
+      return jsonResponse_({ ok: true, data: runRead_(action, payload) });
+    }
+    if (WRITE_ACTIONS.indexOf(action) === -1 && RESET_PASSWORD_ACTIONS.indexOf(action) === -1) fail_("Unknown action");
+    // Optional reads to return with the write result (validated before writing).
+    if (payload.reads != null && payload.reads !== "") reads = parseReads_(payload.reads);
+    // reset_data and record edits/deletes need the reset password. Checked
+    // before taking the lock so guessing (1 s delay) never blocks writers.
     if (RESET_PASSWORD_ACTIONS.indexOf(action) !== -1) assertResetPassword_(payload.resetPassword);
   } catch (error) {
     return errorResponse_(error);
   }
-  return runWrite_(action, payload, user);
+  return runWrite_(action, payload, reads);
 }
 
-function runWrite_(action, input, user) {
+// The name typed in the page header (recorded as "ผู้ทำรายการ" / actor).
+function actorIn_(input) {
+  var v = input.actor;
+  return mbSubstr_(phpTrim_(v !== null && typeof v === "object" ? "" : str_(v)), 0, MAX_PERSON);
+}
+
+function runWrite_(action, input, reads) {
   var lock = LockService.getScriptLock();
   try {
     lock.waitLock(30000);
   } catch (lockError) {
     return jsonResponse_({ ok: false, error: "ระบบกำลังบันทึกรายการอื่นอยู่ กรุณาลองใหม่อีกครั้ง" });
   }
+  var actor = actorIn_(input);
+  var result;
   try {
-    resetRequest_(user);
+    resetRequest_(actor);
     try {
-      var result = handleWrite_(action, input);
+      result = handleWrite_(action, input);
       flush_();
-      return jsonResponse_({ ok: true, data: result });
+      // Versions as of this write, taken while the lock is held: the sheets this
+      // request already holds in memory match them exactly (used by afterReads_).
+      if (reads) versions_();
     } catch (error) {
       // Nothing buffered by the failed action is written (acts as a rollback).
       var message = errorMessage_(error);
       var actName = ACT_NAME[action] || RECORD_ACT_NAME[action];
       if (actName) {
         try {
-          resetRequest_(user);
+          resetRequest_(actor);
           audit_("warn", action, "ปฏิเสธ" + actName + ": " + message, "");
           flush_();
         } catch (ignored) {}
@@ -237,23 +246,47 @@ function runWrite_(action, input, user) {
   } finally {
     lock.releaseLock();
   }
+  // Outside the lock: reads for the page the client shows next (post-write state).
+  if (reads) result.reads = afterReads_(reads);
+  return jsonResponse_({ ok: true, data: result });
 }
 
-// Runs fn under the script lock with a fresh request state and flushes its writes.
-function withLock_(user, fn) {
-  var lock = LockService.getScriptLock();
-  try {
-    lock.waitLock(30000);
-  } catch (lockError) {
-    fail_("ระบบกำลังบันทึกรายการอื่นอยู่ กรุณาลองใหม่อีกครั้ง");
+/* ===================== reads: single, batch, after a write ===================== */
+
+// Read actions use the read cache (writes never do).
+function runRead_(action, p) {
+  REQ_.cacheReads = true;
+  return handleRead_(action, p);
+}
+
+// reads: [{action, ...params}] (array or JSON text; a plain action name is
+// accepted for an item without params). Only BATCH_ACTIONS, at most BATCH_MAX.
+function parseReads_(raw) {
+  var list = raw;
+  if (typeof raw === "string") {
+    try { list = JSON.parse(raw); } catch (e) { fail_("reads ไม่ถูกต้อง"); }
   }
+  if (!Array.isArray(list) || !list.length || list.length > BATCH_MAX) fail_("reads ไม่ถูกต้อง");
+  return list.map(function (r) {
+    if (typeof r === "string") r = { action: r };
+    if (!r || typeof r !== "object" || Array.isArray(r)) fail_("reads ไม่ถูกต้อง");
+    if (BATCH_ACTIONS.indexOf(String(r.action || "")) === -1) fail_("Unknown action");
+    return r;
+  });
+}
+
+function actionBatch_(p) {
+  var reads = parseReads_(p.reads);
+  return { results: reads.map(function (r) { return handleRead_(r.action, r); }) };
+}
+
+// Reads returned with a write result. Any problem -> null (the client then loads normally).
+function afterReads_(reads) {
   try {
-    resetRequest_(user);
-    var result = fn();
-    flush_();
-    return result;
-  } finally {
-    lock.releaseLock();
+    REQ_.cacheReads = true;
+    return reads.map(function (r) { return handleRead_(r.action, r); });
+  } catch (error) {
+    return null;
   }
 }
 
@@ -295,339 +328,8 @@ function passwordError_(message) {
   return error;
 }
 
-/* ===================== accounts & sessions ===================== */
-
 function cache_() {
   return CacheService.getScriptCache();
-}
-
-function hashPassword_(password, salt) {
-  var alg = Utilities.DigestAlgorithm.SHA_256;
-  var h = Utilities.computeDigest(alg, salt + ":" + password, Utilities.Charset.UTF_8);
-  for (var i = 1; i < HASH_ROUNDS; i++) h = Utilities.computeDigest(alg, h);
-  return bytesToHex_(h);
-}
-
-function passwordFields_(password) {
-  var salt = randomHex_(32);
-  return { salt: salt, password_hash: hashPassword_(password, salt) };
-}
-
-function verifyUserPassword_(u, password) {
-  return safeEqual_(hashPassword_(String(password), u.salt), u.password_hash);
-}
-
-function bytesToHex_(bytes) {
-  var out = [];
-  for (var i = 0; i < bytes.length; i++) {
-    var b = bytes[i] & 0xff;
-    out.push((b < 16 ? "0" : "") + b.toString(16));
-  }
-  return out.join("");
-}
-
-function sha256Hex_(s) {
-  return bytesToHex_(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, s, Utilities.Charset.UTF_8));
-}
-
-// Random lowercase hex string of length n (UUIDs + Math.random mixed through SHA-256).
-function randomHex_(n) {
-  var out = "";
-  while (out.length < n) {
-    out += sha256Hex_(Utilities.getUuid() + ":" + Utilities.getUuid() + ":" + Math.random() + ":" + Date.now() + ":" + out);
-  }
-  return out.substring(0, n);
-}
-
-// Constant-time string comparison.
-function safeEqual_(a, b) {
-  a = String(a || "");
-  b = String(b || "");
-  if (a.length !== b.length || !a.length) return false;
-  var diff = 0;
-  for (var i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
-}
-
-// "fullname (username)" — the name recorded on every row the user writes.
-function actorLabel_(u) {
-  if (!u) return "";
-  return phpEmpty_(u.fullname) ? u.username : u.fullname + " (" + u.username + ")";
-}
-
-function publicUser_(u) {
-  return {
-    id: u.id, username: u.username, fullname: u.fullname, role: u.role, active: u.active === 1,
-    created_at: u.created_at, updated_at: u.updated_at, last_login: u.last_login
-  };
-}
-
-function findUserByName_(username) {
-  var key = String(username).toLowerCase();
-  var rows = table_("users").rows;
-  for (var i = 0; i < rows.length; i++) if (String(rows[i].username).toLowerCase() === key) return rows[i];
-  return null;
-}
-
-function findUserById_(id) {
-  var rows = table_("users").rows;
-  for (var i = 0; i < rows.length; i++) if (rows[i].id === id) return rows[i];
-  return null;
-}
-
-function newSession_(u) {
-  var token = randomHex_(64);
-  cache_().put(SESSION_PREFIX + token, JSON.stringify({ uid: u.id, sv: u.salt }), SESSION_TTL);
-  return token;
-}
-
-function authError_() {
-  var error = new Error(AUTH_MESSAGE);
-  error.code = "AUTH";
-  return error;
-}
-
-// Returns the logged-in user (and sets REQ_.user / actor) or throws AUTH.
-// The session is bound to the user's salt and checked against the live users
-// sheet, so disabled accounts and changed/reset passwords lose their sessions.
-function authenticate_(token, action) {
-  token = String(token == null ? "" : token);
-  if (!/^[a-f0-9]{64}$/.test(token)) throw authError_();
-  var raw = cache_().get(SESSION_PREFIX + token);
-  var s = null;
-  try { s = raw ? JSON.parse(raw) : null; } catch (ignored) { s = null; }
-  if (!s) throw authError_();
-  var u = findUserById_(Number(s.uid));
-  if (!u || u.active !== 1 || !safeEqual_(u.salt, s.sv)) {
-    cache_().remove(SESSION_PREFIX + token);
-    throw authError_();
-  }
-  u = plain_(u);
-  u.token = token;
-  if (ADMIN_ACTIONS.indexOf(action) !== -1 && u.role !== "admin") {
-    fail_("เฉพาะผู้ดูแลระบบเท่านั้น / Admins only", "FORBIDDEN");
-  }
-  setUser_(u);
-  return u;
-}
-
-function setUser_(u) {
-  REQ_.user = u;
-  REQ_.actor = actorLabel_(u);
-  REQ_.username = u ? u.username : "";
-}
-
-function loginFailKey_(username) {
-  return LOGIN_FAIL_PREFIX + sha256Hex_(String(username).toLowerCase()).slice(0, 40);
-}
-
-/*
- * login {username, password} -> {token, expires_in, user}
- * While the users sheet is empty, "admin" + PALLET_INITIAL_ADMIN_PASSWORD
- * creates the first admin. Failed attempts are counted per username (10 per
- * 15 min, then locked), cost 1 s each and are written to audit_logs.
- */
-function actionLogin_(p) {
-  var username = phpTrim_(typeof p.username === "string" ? p.username : "").toLowerCase();
-  var password = typeof p.password === "string" ? p.password : "";
-  if (!username || !password) fail_("กรุณากรอกชื่อผู้ใช้และรหัสผ่าน", "LOGIN_FAILED");
-  username = mbSubstr_(username, 0, 60);
-  var cache = cache_();
-  var failKey = loginFailKey_(username);
-  var fails = Number(cache.get(failKey) || 0);
-  if (fails >= LOGIN_MAX_FAILURES) {
-    fail_("เข้าสู่ระบบผิดเกิน " + LOGIN_MAX_FAILURES + " ครั้ง ชื่อผู้ใช้นี้ถูกระงับชั่วคราว 15 นาที กรุณารอแล้วลองใหม่", "LOCKED");
-  }
-
-  resetRequest_(null);
-  var initial = !table_("users").rows.length; // also creates the users sheet when missing
-  var verifiedSalt = null;
-  if (initial) {
-    if (username === INITIAL_ADMIN_USERNAME) {
-      var initialPw = PropertiesService.getScriptProperties().getProperty(INITIAL_ADMIN_PASSWORD_PROPERTY) || "";
-      if (!initialPw) {
-        fail_("ยังไม่มีบัญชีผู้ใช้ในระบบ — กรุณาให้ผู้ดูแลระบบตั้ง Script Property " + INITIAL_ADMIN_PASSWORD_PROPERTY +
-          " (Project Settings > Script properties) แล้วเข้าสู่ระบบด้วยชื่อผู้ใช้ admin และรหัสผ่านนั้น", "SETUP");
-      }
-      if (safeEqual_(password, initialPw)) verifiedSalt = "initial";
-    }
-  } else {
-    var u = findUserByName_(username);
-    if (u && u.active === 1 && verifyUserPassword_(u, password)) verifiedSalt = u.salt;
-  }
-
-  if (!verifiedSalt) {
-    cache.put(failKey, String(fails + 1), LOGIN_LOCK_SECONDS);
-    Utilities.sleep(1000);
-    try {
-      withLock_(null, function () {
-        REQ_.username = username;
-        audit_("account", "login_failed", "เข้าสู่ระบบไม่สำเร็จ: ชื่อผู้ใช้ \"" + username + "\" (ครั้งที่ " + (fails + 1) + ")" +
-          (fails + 1 >= LOGIN_MAX_FAILURES ? " — ระงับชื่อผู้ใช้นี้ชั่วคราว 15 นาที" : ""), "");
-      });
-    } catch (ignored) {}
-    fail_("ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง", "LOGIN_FAILED");
-  }
-
-  return withLock_(null, function () {
-    var now = nowParts_().datetime;
-    var user;
-    if (!table_("users").rows.length) {
-      if (verifiedSalt !== "initial") fail_("ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง", "LOGIN_FAILED");
-      var pf = passwordFields_(password);
-      user = insert_("users", {
-        username: INITIAL_ADMIN_USERNAME, password_hash: pf.password_hash, salt: pf.salt,
-        fullname: INITIAL_ADMIN_FULLNAME, role: "admin", active: 1, created_at: now, updated_at: null, last_login: now
-      });
-      setUser_(user);
-      audit_("account", "user_create", "สร้างบัญชีผู้ดูแลระบบเริ่มต้น \"" + INITIAL_ADMIN_USERNAME +
-        "\" จาก Script Property " + INITIAL_ADMIN_PASSWORD_PROPERTY + " (ควรเปลี่ยนรหัสผ่าน)", INITIAL_ADMIN_USERNAME);
-    } else {
-      user = findUserByName_(username);
-      // Re-checked under the lock; the hash was verified above for this salt.
-      if (!user || user.active !== 1 || !safeEqual_(user.salt, verifiedSalt)) {
-        fail_("ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง", "LOGIN_FAILED");
-      }
-      update_("users", user, { last_login: now });
-      setUser_(user);
-    }
-    cache.remove(failKey);
-    audit_("account", "login", "เข้าสู่ระบบ", user.username);
-    return { token: newSession_(user), expires_in: SESSION_TTL, user: publicUser_(user), initial: verifiedSalt === "initial" };
-  });
-}
-
-function actionLogout_() {
-  cache_().remove(SESSION_PREFIX + REQ_.user.token);
-  audit_("account", "logout", "ออกจากระบบ", REQ_.username);
-  return { message: "ออกจากระบบแล้ว" };
-}
-
-function actionMe_() {
-  return { user: publicUser_(findUserById_(REQ_.user.id) || REQ_.user) };
-}
-
-function actionUsers_() {
-  return {
-    me: REQ_.user.id,
-    users: sortBy_(table_("users").rows.slice(), function (a, b) { return a.id - b.id; }).map(publicUser_)
-  };
-}
-
-function passwordIn_(v, label) {
-  var pw = typeof v === "string" ? v : "";
-  if (pw.length < PASSWORD_MIN) fail_(label + "ต้องมีอย่างน้อย " + PASSWORD_MIN + " ตัวอักษร");
-  if (pw.length > PASSWORD_MAX) fail_(label + "ยาวเกิน " + PASSWORD_MAX + " ตัวอักษร");
-  return pw;
-}
-
-function liveUser_(id) {
-  var u = findUserById_(phpInt_(id));
-  if (!u) fail_("ไม่พบผู้ใช้ (อาจถูกลบไปแล้ว) กรุณาโหลดหน้าใหม่");
-  return u;
-}
-
-// At least one active admin must remain after the proposed change of user u.
-function assertAdminRemains_(u, role, active) {
-  var n = 0;
-  table_("users").rows.forEach(function (r) {
-    var rr = r === u ? role : r.role;
-    var ra = r === u ? active : r.active;
-    if (rr === "admin" && ra === 1) n++;
-  });
-  if (!n) fail_("ต้องมีผู้ดูแลระบบที่ใช้งานอยู่อย่างน้อย 1 คน — ไม่สามารถปิดการใช้งานหรือลดสิทธิ์ผู้ดูแลระบบคนสุดท้ายได้");
-}
-
-function roleName_(r) { return r === "admin" ? "ผู้ดูแลระบบ" : "ผู้ใช้งาน"; }
-function activeName_(a) { return a === 1 ? "ใช้งาน" : "ปิดใช้งาน"; }
-
-// Own password: {old_password, new_password}. A wrong old password counts toward
-// the login lockout of this username. Returns a new token (other sessions end).
-function actionChangePassword_(input) {
-  var u = liveUser_(REQ_.user.id);
-  var failKey = loginFailKey_(u.username);
-  var fails = Number(cache_().get(failKey) || 0);
-  if (fails >= LOGIN_MAX_FAILURES) fail_("ใส่รหัสผ่านผิดหลายครั้งเกินไป กรุณารอ 15 นาที", "LOCKED");
-  var oldPw = typeof input.old_password === "string" ? input.old_password : "";
-  if (!oldPw || !verifyUserPassword_(u, oldPw)) {
-    cache_().put(failKey, String(fails + 1), LOGIN_LOCK_SECONDS);
-    Utilities.sleep(1000);
-    fail_("รหัสผ่านเดิมไม่ถูกต้อง");
-  }
-  var pw = passwordIn_(input.new_password, "รหัสผ่านใหม่");
-  var pf = passwordFields_(pw);
-  update_("users", u, { salt: pf.salt, password_hash: pf.password_hash, updated_at: nowParts_().datetime });
-  cache_().remove(SESSION_PREFIX + REQ_.user.token);
-  audit_("account", "change_password", "เปลี่ยนรหัสผ่านของตนเอง (ออกจากระบบทุกเครื่องอื่น)", u.username);
-  return { token: newSession_(u), user: publicUser_(u), message: "เปลี่ยนรหัสผ่านแล้ว" };
-}
-
-// Admin: create {username, fullname, role, password[, active]} or update {id, fullname, role, active}.
-function actionUserSave_(input) {
-  var id = phpInt_(input.id);
-  var fullname = textIn_(input, "fullname", MAX_PERSON, "ชื่อ-นามสกุล");
-  if (fullname === "") fail_("กรุณากรอกชื่อ-นามสกุล");
-  var role = input.role === undefined || input.role === null || input.role === "" ? null : safeStr_(input.role);
-  if (role !== null && ROLES.indexOf(role) === -1) fail_("บทบาทไม่ถูกต้อง (admin / user)");
-  var active = input.active === undefined || input.active === null || input.active === "" ? null
-    : (input.active === true || input.active === 1 || input.active === "1" || input.active === "true" ? 1 : 0);
-  var now = nowParts_().datetime;
-
-  if (id) {
-    var u = liveUser_(id);
-    var ch = {};
-    var parts = [];
-    if (fullname !== u.fullname) { ch.fullname = fullname; parts.push('ชื่อ "' + u.fullname + '" → "' + fullname + '"'); }
-    if (role !== null && role !== u.role) { ch.role = role; parts.push("บทบาท " + roleName_(u.role) + " → " + roleName_(role)); }
-    if (active !== null && active !== u.active) { ch.active = active; parts.push("สถานะ " + activeName_(u.active) + " → " + activeName_(active)); }
-    if (!parts.length) return { changed: false, message: "ไม่มีการเปลี่ยนแปลง" };
-    assertAdminRemains_(u, ch.role || u.role, ch.active === undefined ? u.active : ch.active);
-    ch.updated_at = now;
-    update_("users", u, ch);
-    audit_("account", "user_update", "แก้ไขบัญชี " + u.username + ": " + parts.join("; ") +
-      (ch.active === 0 ? " (ออกจากระบบทุกเครื่อง)" : ""), u.username);
-    return { changed: true, user: publicUser_(u), message: "บันทึกบัญชี " + u.username + " แล้ว" };
-  }
-
-  var username = phpTrim_(safeStr_(input.username)).toLowerCase();
-  if (!USERNAME_RE.test(username)) fail_("ชื่อผู้ใช้ต้องยาว 3-30 ตัว ใช้ได้เฉพาะ a-z 0-9 . _ -");
-  if (findUserByName_(username)) fail_("ชื่อผู้ใช้ \"" + username + "\" มีอยู่แล้ว");
-  var pw = passwordIn_(input.password, "รหัสผ่าน");
-  var pf = passwordFields_(pw);
-  var nu = insert_("users", {
-    username: username, password_hash: pf.password_hash, salt: pf.salt, fullname: fullname,
-    role: role || "user", active: active === null ? 1 : active, created_at: now, updated_at: null, last_login: null
-  });
-  audit_("account", "user_create", "สร้างบัญชี " + username + " (" + fullname + ") บทบาท " + roleName_(nu.role) +
-    (nu.active === 1 ? "" : " · ปิดใช้งาน"), username);
-  return { changed: true, user: publicUser_(nu), message: "สร้างบัญชี " + username + " แล้ว" };
-}
-
-// Admin: set a new password for a user (ends that user's sessions, lifts a login lockout).
-function actionUserResetPassword_(input) {
-  var u = liveUser_(input.id);
-  var pw = passwordIn_(input.password, "รหัสผ่านใหม่");
-  var pf = passwordFields_(pw);
-  update_("users", u, { salt: pf.salt, password_hash: pf.password_hash, updated_at: nowParts_().datetime });
-  cache_().remove(loginFailKey_(u.username));
-  audit_("account", "user_reset_password", "ตั้งรหัสผ่านใหม่ให้บัญชี " + u.username + " (ออกจากระบบทุกเครื่อง)", u.username);
-  var out = { message: "ตั้งรหัสผ่านใหม่ให้ " + u.username + " แล้ว" };
-  if (u.id === REQ_.user.id) { // own account: keep this browser logged in
-    cache_().remove(SESSION_PREFIX + REQ_.user.token);
-    out.token = newSession_(u);
-  }
-  return out;
-}
-
-// Admin: enable / disable a user (disabling ends that user's sessions).
-function actionUserToggle_(input) {
-  var u = liveUser_(input.id);
-  var active = u.active === 1 ? 0 : 1;
-  if (!active) assertAdminRemains_(u, u.role, 0);
-  update_("users", u, { active: active, updated_at: nowParts_().datetime });
-  audit_("account", "user_toggle", (active ? "เปิดใช้งานบัญชี " : "ปิดใช้งานบัญชี ") + u.username +
-    (active ? "" : " (ออกจากระบบทุกเครื่อง)"), u.username);
-  return { user: publicUser_(u), message: (active ? "เปิดใช้งาน " : "ปิดใช้งาน ") + u.username + " แล้ว" };
 }
 
 /* ===================== router ===================== */
@@ -641,8 +343,7 @@ function handleRead_(action, p) {
     case "export": return exportHistory_(queryHistory_(p));
     case "logs": return { items: queryLogs_(p) };
     case "logs_export": return exportLogs_(queryLogs_(p));
-    case "me": return actionMe_();
-    case "users": return actionUsers_();
+    case "batch": return actionBatch_(p);
   }
   fail_("Unknown action");
 }
@@ -663,11 +364,6 @@ function handleWrite_(action, input) {
     case "movement_delete": return actionMovementDelete_(input);
     case "repair_update": return actionRepairUpdate_(input);
     case "repair_delete": return actionRepairDelete_(input);
-    case "logout": return actionLogout_();
-    case "change_password": return actionChangePassword_(input);
-    case "user_save": return actionUserSave_(input);
-    case "user_reset_password": return actionUserResetPassword_(input);
-    case "user_toggle": return actionUserToggle_(input);
   }
   fail_("Unknown action");
 }
@@ -676,14 +372,24 @@ function handleWrite_(action, input) {
 
 function actionBootstrap_() {
   var now = nowParts_();
+  // types / departments / stock / dept depend only on the data (cached by the
+  // versions of the three sheets); "now" is always fresh.
+  var core = cachedDerived_("boot", ["pallet_types", "departments", "movements"], function () {
+    return {
+      types: sortBy_(table_("pallet_types").rows.slice(), function (a, b) { return a.sort - b.sort || a.id - b.id; }).map(plain_),
+      departments: table_("departments").rows
+        .filter(function (d) { return d.active === 1; })
+        .sort(function (a, b) { return a.id - b.id; })
+        .map(plain_),
+      stock: stockMap_(),
+      dept: deptOutstanding_()
+    };
+  });
   return {
-    types: sortBy_(table_("pallet_types").rows.slice(), function (a, b) { return a.sort - b.sort || a.id - b.id; }).map(plain_),
-    departments: table_("departments").rows
-      .filter(function (d) { return d.active === 1; })
-      .sort(function (a, b) { return a.id - b.id; })
-      .map(plain_),
-    stock: stockMap_(),
-    dept: deptOutstanding_(),
+    types: core.types,
+    departments: core.departments,
+    stock: core.stock,
+    dept: core.dept,
     now: { date: now.date, time: now.time }
   };
 }
@@ -1026,6 +732,7 @@ function actionResetData_() {
     // are recomputed from the now-empty sheet (next id 1, next doc -0001).
     delete REQ_.tables[name];
     delete REQ_.appends[name];
+    REQ_.dirty[name] = true; // cleared directly (not buffered): new data version on flush
   });
   REQ_.updates = REQ_.updates.filter(function (u) { return RESET_TABLES.indexOf(u.name) === -1; });
   REQ_.deletes = REQ_.deletes.filter(function (d) { return RESET_TABLES.indexOf(d.name) === -1; });
@@ -1182,10 +889,10 @@ function actionRepairUpdate_(input) {
       fail_("แก้ไขจำนวน/สถานะ/ประเภท/ฝ่ายของใบแจ้งซ่อมไม่ได้ — แก้ได้ที่รายการแจ้งชำรุดในหน้าประวัติเคลื่อนไหว หรือลบแล้วบันทึกใหม่");
     }
   });
-  // Who opened / changed the ticket is recorded by the server from the login.
+  // Who opened / changed the ticket is recorded automatically (actor name).
   ["reported_by", "reported_username", "updated_by", "updated_username", "updated_at"].forEach(function (k) {
     if (input[k] === undefined) return;
-    if (phpTrim_(safeStr_(input[k])) !== str_(rp[k])) fail_("ผู้แจ้ง / ผู้แก้ไขล่าสุด บันทึกจากบัญชีผู้ใช้โดยอัตโนมัติ แก้ไขไม่ได้");
+    if (phpTrim_(safeStr_(input[k])) !== str_(rp[k])) fail_("ผู้แจ้ง / ผู้แก้ไขล่าสุด บันทึกจากชื่อผู้ใช้งานโดยอัตโนมัติ แก้ไขไม่ได้");
   });
   var fields = [
     ["cause", MAX_TEXT, "สาเหตุการชำรุด"], ["repairer", MAX_PERSON, "ช่างผู้ซ่อม"], ["note", MAX_REPAIR_NOTE, "หมายเหตุ"]
@@ -1527,7 +1234,7 @@ function createTicket_(type, size, qty, source, dept, input, at) {
   return row.id;
 }
 
-// Adds "last changed by" (the logged-in user) to a ticket change set / row.
+// Adds "last changed by" (the actor) to a ticket change set / row.
 function stampTicket_(obj) {
   obj.updated_by = REQ_.actor;
   obj.updated_username = REQ_.username;
@@ -1535,14 +1242,11 @@ function stampTicket_(obj) {
   return obj;
 }
 
-// Display name of the logged-in user (fullname, or username when empty).
+// Name of the person working in the page (typed in the page header).
 function actorName_() {
-  var u = REQ_.user;
-  return u ? (phpEmpty_(u.fullname) ? u.username : u.fullname) : "";
+  return REQ_.actor || "";
 }
 
-// The actor is ALWAYS the logged-in user of this request (set by authenticate_),
-// never a name sent by the client.
 function audit_(category, action, detail, ref) {
   insert_("audit_logs", {
     category: category, action: action, ref: ref || "",
@@ -1564,10 +1268,15 @@ function textIn_(input, key, max, label) {
 
 var REQ_ = null; // per-request state: spreadsheet, loaded tables, pending writes
 
-// user: the authenticated user ({id, username, fullname, ...}) or null.
-function resetRequest_(user) {
-  REQ_ = { ss: null, tables: {}, appends: {}, updates: [], deletes: [], user: null, actor: "", username: "" };
-  if (user) setUser_(user);
+// actor: the name typed in the page header ("" when none).
+// username: always "" (column kept from the former login version).
+function resetRequest_(actor) {
+  REQ_ = {
+    ss: null, tables: {}, appends: {}, updates: [], deletes: [], actor: actor || "", username: "",
+    dirty: {},          // sheets changed outside the buffers (reset_data) -> version bump on flush
+    cacheReads: false,  // true only while answering read actions
+    vers: null          // data versions read for this request (see versions_)
+  };
 }
 
 function db_() {
@@ -1585,6 +1294,13 @@ function db_() {
 // rows read them as empty), so an older live spreadsheet upgrades itself.
 function table_(name) {
   if (REQ_.tables[name]) return REQ_.tables[name];
+  var cacheable = REQ_.cacheReads && CACHED_TABLES.indexOf(name) !== -1;
+  var ver = null;
+  if (cacheable) {
+    ver = versions_()[name] || null; // taken BEFORE the sheet is read
+    var hit = ver ? cachedRows_(name, ver) : null;
+    if (hit) return (REQ_.tables[name] = hit);
+  }
   var sheet = db_().getSheetByName(name);
   if (!sheet && AUTO_CREATE_TABLES.indexOf(name) !== -1) sheet = prepareSheet_(db_(), name, null);
   if (!sheet) throw new Error('ไม่พบชีต "' + name + '" กรุณารัน setupSystem() อีกครั้ง');
@@ -1612,8 +1328,148 @@ function table_(name) {
     if (obj.id > maxId) maxId = obj.id;
     rows.push(obj);
   }
-  REQ_.tables[name] = { name: name, sheet: sheet, header: header, idx: idx, rows: rows, maxId: maxId };
+  // values: the raw sheet rows, so flush_ can update a row without reading it again.
+  REQ_.tables[name] = { name: name, sheet: sheet, header: header, idx: idx, rows: rows, maxId: maxId, values: values };
+  if (ver) storeRows_(name, ver, rows);
   return REQ_.tables[name];
+}
+
+/* ---------- read cache helpers (see CACHED_TABLES) ---------- */
+
+function newVersion_() {
+  return Date.now().toString(36) + "." + Utilities.getUuid().replace(/-/g, "").slice(0, 12);
+}
+
+// The current data version of every cached sheet (one CacheService call per
+// request). A missing version (evicted / first use) gets a new random one, so
+// nothing stored under an older version can match it. Cache errors disable the
+// read cache for the request ({}).
+function versions_() {
+  if (REQ_.vers) return REQ_.vers;
+  var vers = {};
+  try {
+    var keys = CACHED_TABLES.map(function (n) { return VERSION_PREFIX + n; });
+    var got = cache_().getAll(keys) || {};
+    var missing = {};
+    CACHED_TABLES.forEach(function (n) {
+      var v = got[VERSION_PREFIX + n];
+      if (!v) { v = newVersion_(); missing[VERSION_PREFIX + n] = v; }
+      vers[n] = v;
+    });
+    if (Object.keys(missing).length) cache_().putAll(missing, VERSION_TTL);
+  } catch (error) {
+    vers = {};
+  }
+  REQ_.vers = vers;
+  return vers;
+}
+
+// Gives every named (cached) sheet a new data version. Called after the
+// changes are flushed to the spreadsheet. If the cache cannot be updated the
+// versions are removed instead (readers then start new ones).
+function bumpVersions_(names) {
+  var map = {};
+  names.forEach(function (n) { if (CACHED_TABLES.indexOf(n) !== -1) map[VERSION_PREFIX + n] = newVersion_(); });
+  var keys = Object.keys(map);
+  if (!keys.length) return;
+  try {
+    cache_().putAll(map, VERSION_TTL);
+  } catch (error) {
+    try { cache_().removeAll(keys); } catch (ignored) {}
+  }
+  if (REQ_ && REQ_.vers) REQ_.vers = null; // re-read on the next cached read of this request
+}
+
+// Stores text under key in chunks of RC_CHUNK characters: key holds "<n>|<chunk 0>",
+// key_1..key_<n-1> the rest. Too big (> RC_MAX_CHUNKS) or cache errors: not stored.
+function rcPut_(key, text) {
+  var n = Math.max(1, Math.ceil(text.length / RC_CHUNK));
+  if (n > RC_MAX_CHUNKS) return;
+  var map = {};
+  for (var i = 0; i < n; i++) {
+    var part = text.substr(i * RC_CHUNK, RC_CHUNK);
+    map[i ? key + "_" + i : key] = i ? part : n + "|" + part;
+  }
+  try { cache_().putAll(map, READ_CACHE_TTL); } catch (ignored) {}
+}
+
+function rcGet_(key) {
+  try {
+    var head = cache_().get(key);
+    if (!head) return null;
+    var bar = head.indexOf("|");
+    var n = parseInt(head.slice(0, bar), 10);
+    if (!(n >= 1)) return null;
+    var parts = [head.slice(bar + 1)];
+    if (n > 1) {
+      var keys = [];
+      for (var i = 1; i < n; i++) keys.push(key + "_" + i);
+      var got = cache_().getAll(keys) || {};
+      for (var j = 0; j < keys.length; j++) {
+        if (typeof got[keys[j]] !== "string") return null;
+        parts.push(got[keys[j]]);
+      }
+    }
+    return parts.join("");
+  } catch (error) {
+    return null;
+  }
+}
+
+// Rows are stored as arrays in SCHEMA order, normalised exactly like a sheet
+// round trip (toCell_ -> fromCell_), so cached and live reads are identical.
+function storeRows_(name, ver, rows) {
+  var cols = SCHEMA[name];
+  var data = rows.map(function (r) {
+    return cols.map(function (c) { return fromCell_(c[1], toCell_(c[1], r[c[0]])); });
+  });
+  rcPut_(RC_PREFIX + name + "_" + ver, JSON.stringify(data));
+}
+
+function cachedRows_(name, ver) {
+  var text = rcGet_(RC_PREFIX + name + "_" + ver);
+  if (!text) return null;
+  var data;
+  try { data = JSON.parse(text); } catch (error) { return null; }
+  var cols = SCHEMA[name];
+  var maxId = 0;
+  var rows = data.map(function (a) {
+    var obj = {};
+    cols.forEach(function (c, i) { obj[c[0]] = a[i]; });
+    Object.defineProperty(obj, "_row", { value: 0, writable: true, enumerable: false });
+    if (obj.id > maxId) maxId = obj.id;
+    return obj;
+  });
+  // No sheet: tables from the cache are read-only (writes always read live).
+  return { name: name, sheet: null, header: null, idx: null, rows: rows, maxId: maxId, values: null, cached: true };
+}
+
+// Result of fn() cached under the versions of the sheets it depends on.
+function cachedDerived_(id, deps, fn) {
+  if (!REQ_.cacheReads) return fn();
+  var vers = versions_();
+  var parts = [];
+  for (var i = 0; i < deps.length; i++) {
+    if (!vers[deps[i]]) return fn();
+    parts.push(vers[deps[i]]);
+  }
+  var key = RC_PREFIX + id + "_" + parts.join("_");
+  var text = rcGet_(key);
+  if (text) {
+    try { return JSON.parse(text); } catch (ignored) {}
+  }
+  var value = fn();
+  rcPut_(key, JSON.stringify(value));
+  return value;
+}
+
+/**
+ * Run from the Apps Script editor after editing the spreadsheet by hand: gives
+ * every cached sheet a new data version, so the next reads load the sheets.
+ */
+function clearReadCache() {
+  bumpVersions_(CACHED_TABLES);
+  return { cleared: CACHED_TABLES };
 }
 
 function insert_(name, obj) {
@@ -1654,12 +1510,34 @@ function delete_(name, row) {
 // each run of consecutive rows in one deleteRows call), then appends (one
 // setNumberFormats + one setValues per table). Tables that lost rows are
 // dropped from the per-request cache because their row numbers have shifted.
+// Afterwards every changed sheet gets a new data version (read cache), also when
+// a write fails half-way.
 function flush_() {
+  var changed = Object.keys(REQ_.dirty);
+  REQ_.updates.forEach(function (u) { changed.push(u.name); });
+  REQ_.deletes.forEach(function (d) { changed.push(d.name); });
+  Object.keys(REQ_.appends).forEach(function (n) { if (REQ_.appends[n].length) changed.push(n); });
+  REQ_.dirty = {};
+  try {
+    flushBuffers_();
+  } finally {
+    if (changed.length) {
+      // Make the writes visible to other executions before announcing them.
+      try { SpreadsheetApp.flush(); } catch (ignored) {}
+      bumpVersions_(changed.filter(function (n, i, a) { return a.indexOf(n) === i; }));
+    }
+  }
+}
+
+function flushBuffers_() {
   REQ_.updates.forEach(function (u) {
     var t = REQ_.tables[u.name];
     var range = t.sheet.getRange(u.row._row, 1, 1, t.header.length);
-    var current = range.getValues()[0];
-    range.setValues([rowValues_(u.name, t, u.row, t.header.length, current)]);
+    // The row as read at the start of this request (under the lock), else read it now.
+    var current = t.values && t.values[u.row._row - 1] ? t.values[u.row._row - 1] : range.getValues()[0];
+    var next = rowValues_(u.name, t, u.row, t.header.length, current);
+    range.setValues([next]);
+    if (t.values && t.values[u.row._row - 1]) t.values[u.row._row - 1] = next;
   });
   REQ_.updates = [];
 
@@ -1723,6 +1601,7 @@ function addMissingColumns_(sheet, name, header) {
   for (var r = 0; r < maxRows; r++) formats.push(rowFormat);
   sheet.getRange(1, start, maxRows, missing.length).setNumberFormats(formats);
   sheet.getRange(1, start, 1, missing.length).setFontWeight("bold");
+  bumpVersions_([name]);
   return header.concat(missing.map(function (c) { return c[0]; }));
 }
 
@@ -1805,7 +1684,7 @@ function setupSystem() {
   resetRequest_(null);
   REQ_.ss = ss;
   // Older sheets: append columns added to SCHEMA since they were created.
-  TABLE_ORDER.forEach(function (name) { table_(name); });
+  TABLE_ORDER.forEach(function (name) { table_(name); REQ_.dirty[name] = true; });
   if (!table_("pallet_types").rows.length) {
     SEED_TYPES.forEach(function (t) {
       insert_("pallet_types", { tkey: t[0], code: t[1], name: t[2], short: t[3], description: t[4], color: t[5], sizes: t[6], sort: t[7] });
@@ -1823,8 +1702,6 @@ function setupSystem() {
     created: created,
     spreadsheetId: ss.getId(),
     spreadsheetUrl: ss.getUrl(),
-    users: Math.max(0, ss.getSheetByName("users").getLastRow() - 1),
-    initialAdminPasswordConfigured: Boolean(properties.getProperty(INITIAL_ADMIN_PASSWORD_PROPERTY)),
     resetPasswordConfigured: Boolean(properties.getProperty(RESET_PASSWORD_PROPERTY))
   };
   console.log(JSON.stringify(result));

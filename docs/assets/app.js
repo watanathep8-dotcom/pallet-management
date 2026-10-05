@@ -6,11 +6,8 @@ const S = { types: [], depts: [], stock: {}, dept: [], charts: [] };
 const store = (fn, k, v) => { try { return fn === 'get' ? localStorage.getItem(k) : fn === 'del' ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch { return null; } };
 const sessionGet = k => { try { return sessionStorage.getItem(k); } catch { return null; } };
 const sessionSet = (k, v) => { try { sessionStorage.setItem(k, v); } catch {} };
-/* เข้าสู่ระบบ: session token (จาก action login) เก็บใน localStorage — ไม่เก็บรหัสผ่าน
-   ผู้ทำรายการในประวัติ/Log เซิร์ฟเวอร์บันทึกจากบัญชีที่เข้าสู่ระบบเอง (ไม่ได้มาจากหน้าเว็บ) */
-const TOKEN_KEY = 'palletToken';
-let authToken = store('get', TOKEN_KEY) || '';
-S.me = null;
+/* ผู้ใช้งาน: ชื่อที่ตั้งไว้มุมขวาบน (เก็บในเบราว์เซอร์นี้) — ส่งไปกับทุกการบันทึก เป็น “ผู้ทำรายการ” ในประวัติ / Log */
+S.user = store('get', 'palletUser') || '';
 
 const STATUS = {
   available: { name: 'พร้อมใช้', icon: 'fa-circle-check', c: '#12b76a' },
@@ -39,12 +36,11 @@ const PAGES = {
   history: ['ประวัติเคลื่อนไหว', 'ทุกการเคลื่อนไหวของพาเลท ค้นหา / ส่งออก Excel'],
   logs: ['บันทึกประวัติ (Log)', 'ทุกการกระทำในระบบ — ใคร ทำอะไร เมื่อไร'],
   settings: ['ตั้งค่าฝ่าย', 'จัดการรายชื่อฝ่ายที่เบิกจ่ายพาเลท'],
-  account: ['ตั้งค่าบัญชี', 'บัญชีผู้ใช้ รหัสผ่าน และสิทธิ์การใช้งาน'],
 };
 
 /* ---------- API (Google Apps Script web app) ---------- */
-// อ่านข้อมูล = GET ?action=...&token=...  /  บันทึก = POST text/plain (JSON) — ไม่เกิด CORS preflight
-// ทุกคำสั่งต้องมี session token (เข้าสู่ระบบ) — เซิร์ฟเวอร์ตอบ code 'AUTH' เมื่อยังไม่เข้าสู่ระบบ/หมดอายุ
+// อ่านข้อมูล = GET ?action=...  /  บันทึก = POST text/plain (JSON) — ไม่เกิด CORS preflight
+// ทุก POST ส่งชื่อผู้ใช้งาน (actor) ไปด้วย — เซิร์ฟเวอร์บันทึกเป็นผู้ทำรายการ
 const API_URL = String((window.PALLET_CONFIG || {}).apiUrl || '').trim();
 const NO_API_MSG = 'ยังไม่ได้ตั้งค่า apiUrl — ใส่ URL ของ Google Apps Script (/exec) ในไฟล์ docs/config.js';
 async function gasFetch(url, opt) {
@@ -57,7 +53,6 @@ async function gasFetch(url, opt) {
     const e = new Error((j && j.error) || 'เกิดข้อผิดพลาด');
     e.passwordError = !!(j && j.passwordError);
     e.code = (j && j.code) || '';
-    if (e.code === 'AUTH') authLost(); // token หมดอายุ / ถูกปิดบัญชี / เปลี่ยนรหัสผ่าน → กลับหน้าเข้าสู่ระบบ
     throw e;
   }
   return { ok: true, ...(j.data || {}) };
@@ -67,13 +62,12 @@ function gasGet(action, params = '') {
   const u = new URL(API_URL, location.href);
   new URLSearchParams(params.replace(/^&/, '')).forEach((v, k) => u.searchParams.set(k, v));
   u.searchParams.set('action', action);
-  u.searchParams.set('token', authToken);
   u.searchParams.set('_', Date.now());
   return gasFetch(u.toString(), { method: 'GET' });
 }
 function gasPost(payload) {
   if (!API_URL) return Promise.reject(new Error(NO_API_MSG));
-  return gasFetch(API_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=UTF-8' }, body: JSON.stringify({ ...payload, token: authToken }) });
+  return gasFetch(API_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=UTF-8' }, body: JSON.stringify({ actor: S.user || '', ...payload }) });
 }
 async function api(action, body, params = '') {
   if (!body) return gasGet(action, params);
@@ -82,10 +76,12 @@ async function api(action, body, params = '') {
 /* แก้ไข / ลบรายการที่บันทึกแล้ว: ใช้รหัสรีเซ็ตข้อมูล (PALLET_RESET_PASSWORD) เพิ่มจากการเข้าสู่ระบบ
    เก็บในหน่วยความจำเท่านั้นหลังตรวจผ่าน (หายเมื่อรีเฟรช/ปิดหน้า/ออกจากระบบ) และล้างทิ้งเมื่อเซิร์ฟเวอร์แจ้งรหัสผิด/ถูกล็อก */
 let recordPassword = '';
-async function recordApi(action, body) {
+async function recordApi(action, body, reads = routeReads()) {
   const pw = await askPassword('record');
   try {
-    return await gasPost({ ...body, action, resetPassword: pw });
+    const r = await gasPost({ ...body, ...readsField(reads), action, resetPassword: pw });
+    afterWrite(r, reads);
+    return r;
   } catch (e) {
     if (e.passwordError) recordPassword = '';
     throw e;
@@ -93,9 +89,9 @@ async function recordApi(action, body) {
 }
 const PW_KIND = {
   record: {
-    title: 'รหัสรีเซ็ตข้อมูล (แก้ไข / ลบรายการ)', label: 'รหัสรีเซ็ตข้อมูล', icon: 'fa-user-shield',
-    desc: 'การแก้ไขหรือลบรายการที่บันทึกแล้วต้องใช้รหัสรีเซ็ตข้อมูล (ตั้งโดยผู้ดูแลระบบ — คนละรหัสกับรหัสเข้าสู่ระบบ · ถามครั้งเดียวต่อการเปิดหน้านี้)',
-    cancel: 'ยกเลิก — ต้องใส่รหัสรีเซ็ตข้อมูลก่อนแก้ไข/ลบรายการ',
+    title: 'รหัสรีเซ็ตข้อมูล (แก้ไข / ลบรายการ / ดู Log)', label: 'รหัสรีเซ็ตข้อมูล', icon: 'fa-user-shield',
+    desc: 'การแก้ไขหรือลบรายการที่บันทึกแล้ว และการดูบันทึกประวัติ (Log) ต้องใช้รหัสรีเซ็ตข้อมูล (ตั้งโดยผู้ดูแลระบบ · ถามครั้งเดียวต่อการเปิดหน้านี้)',
+    cancel: 'ยกเลิก — ต้องใส่รหัสรีเซ็ตข้อมูลก่อนแก้ไข/ลบรายการ หรือดู Log',
     get: () => recordPassword, set: v => { recordPassword = v; },
     verify: pw => gasPost({ action: 'verifyResetPassword', resetPassword: pw }),
   },
@@ -127,7 +123,6 @@ function askPassword(kind = 'record') {
         await K.verify(pw);
         K.set(pw); done(); resolve(pw);
       } catch (e) {
-        if (e.code === 'AUTH') { done(); reject(e); return; }
         err.textContent = e.message; inp.value = ''; inp.focus();
         ok.disabled = false; ok.innerHTML = '<i class="fa-solid fa-unlock"></i>ยืนยัน';
       }
@@ -140,10 +135,20 @@ function askPassword(kind = 'record') {
   }).finally(() => { S.pwPending[kind] = null; S.pwCancel = null; });
   return S.pwPending[kind];
 }
+/* บันทึกประวัติ (Log): ต้องใช้รหัสรีเซ็ตข้อมูล (ส่งแบบ POST — ไม่อยู่ใน URL) ใช้รหัสที่จำไว้ในหน้านี้ */
+async function logsApi(action, params) {
+  const pw = await askPassword('record');
+  try {
+    return await gasPost({ ...Object.fromEntries(new URLSearchParams(params.replace(/^&/, ''))), action, resetPassword: pw });
+  } catch (e) {
+    if (e.passwordError) recordPassword = '';
+    throw e;
+  }
+}
 /* ส่งออก Excel (CSV) — เซิร์ฟเวอร์สร้าง CSV แล้วดาวน์โหลดเป็นไฟล์ในเบราว์เซอร์ */
 async function downloadCsv(action, params) {
   try {
-    const r = await gasGet(action, params);
+    const r = action === 'logs_export' ? await logsApi(action, params) : await gasGet(action, params);
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob(['\uFEFF' + r.csv], { type: 'text/csv;charset=utf-8' }));
     a.download = r.filename;
@@ -152,9 +157,54 @@ async function downloadCsv(action, params) {
   } catch (e) { toast(e.message, 'err'); }
 }
 if (!API_URL) $('#cfgBanner').hidden = false;
-async function boot() {
-  const j = await api('bootstrap');
+function applyBoot(j) {
   Object.assign(S, { types: j.types, depts: j.departments, stock: j.stock, dept: j.dept, now: j.now });
+}
+
+/* ---------- อ่านหลายรายการในคำขอเดียว (batch) ----------
+   reads = [[action, '&k=v...'], ...] — เซิร์ฟเวอร์ตอบผลของทุกรายการในครั้งเดียว (ลดการรอ Apps Script ทีละรอบ)
+   เซิร์ฟเวอร์รุ่นเก่าที่ยังไม่มี batch → อ่านแต่ละรายการพร้อมกันแทน */
+const readsSpec = reads => reads.map(([a, p = '']) => ({ action: a, ...Object.fromEntries(new URLSearchParams(p.replace(/^&/, ''))) }));
+const readsField = reads => reads.length ? { reads: readsSpec(reads) } : {};
+let noBatch = false;
+async function readMany(reads) {
+  if (!noBatch) {
+    try {
+      const r = await gasGet('batch', '&reads=' + encodeURIComponent(JSON.stringify(readsSpec(reads))));
+      return r.results.map(d => ({ ok: true, ...d }));
+    } catch (e) {
+      if (e.message !== 'Unknown action') throw e;
+      noBatch = true;
+    }
+  }
+  return Promise.all(reads.map(([a, p]) => gasGet(a, p)));
+}
+
+/* ---------- แคชผลการอ่านล่าสุด (แสดงทันทีเมื่อเปิด/เปลี่ยนหน้า แล้วโหลดใหม่จากเซิร์ฟเวอร์เบื้องหลัง) ----------
+   key = action + params · ใช้เพื่อแสดงผลเท่านั้น — การบันทึกตรวจยอดที่เซิร์ฟเวอร์เสมอ · Log (ต้องใช้รหัส) ไม่เก็บ
+   ล้างทั้งหมดหลังบันทึกทุกครั้ง (แทนด้วยข้อมูลใหม่ที่ได้มากับผลการบันทึก) */
+const RC_PREFIX = 'palletRC:';
+const RC_FRESH_MS = 5000; // ข้อมูลที่เพิ่งได้มา (< 5 วินาที) ไม่ต้องโหลดซ้ำ
+const rcKey = ([a, p = '']) => RC_PREFIX + a + p;
+function rcGet(r) {
+  try { const v = JSON.parse(localStorage.getItem(rcKey(r)) || 'null'); return v && v.d ? v : null; } catch { return null; }
+}
+function rcPut(r, d) {
+  if (!d) return;
+  try { const s = JSON.stringify({ t: Date.now(), d }); if (s.length < 500000) localStorage.setItem(rcKey(r), s); } catch {}
+}
+function rcClear() {
+  try { Object.keys(localStorage).filter(k => k.startsWith(RC_PREFIX)).forEach(k => localStorage.removeItem(k)); } catch {}
+}
+/* บันทึกสำเร็จ: ข้อมูลที่แคชไว้อาจเก่าแล้วทั้งหมด → ล้าง แล้วเก็บผลอ่านใหม่ที่เซิร์ฟเวอร์ส่งมากับผลการบันทึก */
+function afterWrite(r, reads) {
+  rcClear();
+  if (Array.isArray(r?.reads) && r.reads.length === reads.length) r.reads.forEach((d, i) => rcPut(reads[i], { ok: true, ...d }));
+}
+async function writeApi(action, body, reads = routeReads()) {
+  const r = await api(action, { ...body, ...readsField(reads) });
+  afterWrite(r, reads);
+  return r;
 }
 
 /* ---------- helpers ---------- */
@@ -292,120 +342,94 @@ document.addEventListener('animationend', e => {
   }
 });
 
-/* ================= LOGIN / SESSION ================= */
-const ROLE = { admin: ['ผู้ดูแลระบบ', '#E2231A', 'fa-user-shield'], user: ['ผู้ใช้งาน', '#0ea5e9', 'fa-user'] };
-const roleTag = r => { const x = ROLE[r] || [r, '#667085', 'fa-user']; return `<span class="tag" style="--c:${x[1]}"><i class="fa-solid ${x[2]}"></i>${esc(x[0])}</span>`; };
-const isAdmin = () => S.me?.role === 'admin';
-function setMe(u) {
-  S.me = u || null; paintUser();
-  // บันทึกประวัติ (Log) เห็นเฉพาะผู้ดูแลระบบ (server ก็ตรวจสิทธิ์ด้วย)
-  $$('.nav a[data-page="logs"]').forEach(a => { a.hidden = !isAdmin(); });
-}
-function setToken(t) { authToken = t || ''; if (authToken) store('set', TOKEN_KEY, authToken); else store('del', TOKEN_KEY); }
+/* ================= ผู้ใช้งาน (ชื่อมุมขวาบน) =================
+   ชื่อนี้ส่งไปกับทุกการบันทึก และแสดงเป็น “ผู้ทำรายการ” ในประวัติ / Log */
 function paintUser() {
-  const u = S.me;
-  $('#userName').textContent = u ? u.fullname || u.username : '—';
-  $('#userAv').innerHTML = u ? esc((u.fullname || u.username).trim().charAt(0).toUpperCase()) : '<i class="fa-solid fa-user"></i>';
-  $('#umName').textContent = u ? u.fullname || u.username : '';
-  $('#umInfo').textContent = u ? `${u.username} · ${(ROLE[u.role] || [u.role])[0]}` : '';
-  $('#userChip').title = u ? `เข้าสู่ระบบเป็น ${u.fullname} (${u.username})` : 'บัญชีผู้ใช้';
+  $('#userName').textContent = S.user || 'ระบุชื่อผู้ใช้';
+  $('#userAv').innerHTML = S.user ? esc(S.user.trim().charAt(0)) : '<i class="fa-solid fa-user"></i>';
 }
-function showLogin(msg = '') {
-  closeUserMenu();
-  closeModal();
-  S.pwCancel?.();
-  const box = $('#loginScreen');
-  box.classList.remove('checking');
-  box.hidden = false;
-  $('#lgErr').textContent = msg;
-  $('#lgPass').value = '';
-  const btn = $('#lgBtn'); btn.disabled = false; btn.innerHTML = '<i class="fa-solid fa-right-to-bracket"></i>เข้าสู่ระบบ';
-  setTimeout(() => ($('#lgUser').value ? $('#lgPass') : $('#lgUser')).focus(), 50);
-}
-function hideLogin() { $('#loginScreen').hidden = true; $('#lgPass').value = ''; $('#lgErr').textContent = ''; }
-/* เซิร์ฟเวอร์ตอบ AUTH (ยังไม่เข้าสู่ระบบ / เซสชันหมดอายุ / บัญชีถูกปิด / รหัสผ่านถูกเปลี่ยน) */
-function authLost() {
-  const had = !!authToken;
-  setToken(''); setMe(null); recordPassword = '';
-  showLogin(had ? 'เซสชันหมดอายุหรือถูกยกเลิก กรุณาเข้าสู่ระบบใหม่' : '');
-}
-$('#loginForm').onsubmit = async e => {
-  e.preventDefault();
-  const user = $('#lgUser').value.trim(), pass = $('#lgPass').value, btn = $('#lgBtn'), err = $('#lgErr');
-  if (!user || !pass) { err.textContent = 'กรุณากรอกชื่อผู้ใช้และรหัสผ่าน'; return; }
-  btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> กำลังเข้าสู่ระบบ...'; err.textContent = '';
-  try {
-    const r = await gasPost({ action: 'login', username: user, password: pass });
-    setToken(r.token); setMe(r.user); hideLogin();
-    toast(`สวัสดีคุณ${r.user.fullname || r.user.username}`, 'info');
-    if (r.initial) { toast('สร้างบัญชีผู้ดูแลระบบแล้ว — กรุณาเปลี่ยนรหัสผ่านที่ “ตั้งค่าบัญชี”', 'info'); location.hash = 'account'; }
-    route();
-  } catch (x) {
-    err.textContent = x.message; $('#lgPass').value = ''; $('#lgPass').focus();
-    btn.disabled = false; btn.innerHTML = '<i class="fa-solid fa-right-to-bracket"></i>เข้าสู่ระบบ';
-  }
+$('#userChip').onclick = () => {
+  const m = modal(`<h3><i class="fa-solid fa-user-pen" style="color:var(--brand)"></i> ผู้ใช้งาน</h3>
+    <p style="color:var(--muted)">ชื่อนี้จะถูกบันทึกเป็น “ผู้ทำรายการ” ในประวัติและ Log ทุกรายการ</p>
+    <div class="field mt"><label>ชื่อ - นามสกุล</label><input id="uName" value="${esc(S.user)}" placeholder="เช่น สมชาย ใจดี"></div>
+    <div class="modal-acts"><button class="btn btn-ghost" data-close>ยกเลิก</button><button class="btn btn-primary" id="uSave"><i class="fa-solid fa-check"></i>บันทึก</button></div>`);
+  const inp = $('#uName', m); inp.focus(); inp.select();
+  const save = () => { S.user = inp.value.trim().slice(0, 60); store('set', 'palletUser', S.user); paintUser(); closeModal(); toast(S.user ? `สวัสดีคุณ${S.user}` : 'ล้างชื่อผู้ใช้แล้ว', 'info'); route(); };
+  $('#uSave', m).onclick = save;
+  inp.onkeydown = e => e.key === 'Enter' && save();
 };
-async function logout() {
-  closeUserMenu();
-  try { await gasPost({ action: 'logout' }); } catch {}
-  setToken(''); setMe(null); recordPassword = '';
-  view.innerHTML = '';
-  showLogin('ออกจากระบบแล้ว');
-}
-function closeUserMenu() { $('#userMenu').hidden = true; $('#userChip').setAttribute('aria-expanded', 'false'); }
-$('#userChip').onclick = e => {
-  e.stopPropagation();
-  const m = $('#userMenu');
-  m.hidden = !m.hidden;
-  $('#userChip').setAttribute('aria-expanded', String(!m.hidden));
-};
-$('#umAccount').onclick = () => { closeUserMenu(); location.hash = 'account'; };
-$('#umLogout').onclick = logout;
-document.addEventListener('click', e => { if (!e.target.closest('.user-wrap')) closeUserMenu(); });
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeUserMenu(); });
-/* เริ่มต้น: มี token → ตรวจกับเซิร์ฟเวอร์ (me) / ไม่มี → แสดงหน้าเข้าสู่ระบบ */
-async function start() {
-  if (!API_URL) return showLogin(NO_API_MSG);
-  if (!authToken) return showLogin();
-  try {
-    const r = await gasGet('me');
-    setMe(r.user); hideLogin(); route();
-  } catch (e) {
-    if (e.code !== 'AUTH') showLogin(e.message);
-  }
-}
+paintUser();
 
 /* ================= ROUTER ================= */
+/* ข้อมูลที่แต่ละหน้าต้องใช้ (นอกจาก bootstrap) — ค่าเริ่มต้นของตัวกรองตรงกับที่หน้านั้นใช้
+   (Log โหลดเองหลังถามรหัส — ไม่แคช) */
+const monthFirst = () => nowParts().date.slice(0, 8) + '01';
+const dashDays = () => +(sessionGet('dashDays') || 7);
+function pageReads(p) {
+  return ({
+    dashboard: [['dashboard', '&days=' + dashDays()]],
+    repair: [['repairs', '']],
+    history: [['history', '&' + new URLSearchParams({ from: monthFirst(), to: nowParts().date, type: '', act: '', dept: '', q: '' })]],
+  })[p] || [];
+}
+const currentPage = () => { const page = (location.hash.slice(1) || 'dashboard').split('?')[0]; return PAGES[page] ? page : 'dashboard'; };
+const routeReads = (p = currentPage()) => [['bootstrap', ''], ...pageReads(p)];
+const PAGE_FN = {
+  dashboard: ([d]) => dashboard(d), repair: ([r]) => repair(r), history: ([h]) => history(h), logs, stock, settings,
+  receive: () => txForm('receive'), issue: () => txForm('issue'), return: () => txForm('return'), damage: () => txForm('damage'),
+};
+// ผู้ใช้เริ่มกรอก/เลือกในหน้านี้แล้ว → ข้อมูลใหม่จะไม่วาดหน้าทับ (หน้าแบบฟอร์มอัปเดตเฉพาะยอดคงเหลือ)
+['input', 'change'].forEach(ev => view.addEventListener(ev, () => { S.dirty = true; }, true));
+view.addEventListener('pointerdown', e => { if (e.target.closest('button, input, select, textarea, label')) S.dirty = true; }, true);
+const sigOf = res => JSON.stringify(res.map((d, i) => (i ? d : { ...d, now: null })));
+let routeSeq = 0;
+/* แสดงข้อมูลล่าสุดที่แคชไว้ทันที (ถ้ามี) แล้วโหลดจากเซิร์ฟเวอร์ในคำขอเดียว (batch) — วาดใหม่เฉพาะเมื่อข้อมูลเปลี่ยน */
 async function route() {
-  if (!authToken || !S.me) return; // ยังไม่เข้าสู่ระบบ: หน้าเข้าสู่ระบบแสดงอยู่
-  const page = (location.hash.slice(1) || 'dashboard').split('?')[0];
-  const p = PAGES[page] && !(page === 'logs' && !isAdmin()) ? page : 'dashboard';
+  const p = currentPage();
   $$('.nav a').forEach(a => a.classList.toggle('active', a.dataset.page === p));
   $('#pageTitle').textContent = PAGES[p][0];
   $('#pageSub').textContent = PAGES[p][1];
   $('#sidebar').classList.remove('open');
-  killCharts(); view.onclick = null;
+  const seq = ++routeSeq;
+  const reads = routeReads(p);
+  const hits = reads.map(rcGet);
+  const cached = hits.every(Boolean) ? hits.map(h => h.d) : null;
+  const paint = async res => {
+    killCharts(); view.onclick = null; S.onFresh = null; S.dirty = false;
+    applyBoot(res[0]);
+    updateBadge();
+    await PAGE_FN[p](res.slice(1));
+  };
+  killCharts(); view.onclick = null; S.onFresh = null;
   view.innerHTML = '<div class="spinner"></div>';
   view.style.animation = 'none'; view.offsetHeight; view.style.animation = '';
+  let shown = null;
+  if (cached) {
+    try { await paint(cached); shown = sigOf(cached); } catch { view.innerHTML = '<div class="spinner"></div>'; }
+    if (shown && hits.every(h => Date.now() - h.t < RC_FRESH_MS)) return; // เพิ่งได้มาจากเซิร์ฟเวอร์
+  }
   try {
-    await boot();
-    updateBadge();
-    await ({ dashboard, logs, receive: () => txForm('receive'), issue: () => txForm('issue'), return: () => txForm('return'), damage: () => txForm('damage'), repair, stock, history, settings, account })[p]();
+    const res = await readMany(reads);
+    if (seq !== routeSeq) return; // เปลี่ยนหน้าไปแล้ว
+    res.forEach((d, i) => rcPut(reads[i], d));
+    if (shown === sigOf(res)) { applyBoot(res[0]); return; }
+    if (shown !== null && (S.dirty || p === 'logs')) { applyBoot(res[0]); updateBadge(); S.onFresh?.(); return; } // Log: ไม่โหลดซ้ำ
+    await paint(res);
   } catch (e) {
-    if (e.code === 'AUTH') { view.innerHTML = ''; return; }
+    if (seq !== routeSeq) return;
+    if (shown !== null) { toast(e.message, 'err'); return; }
     view.innerHTML = `<div class="card empty"><i class="fa-solid fa-plug-circle-xmark"></i>${esc(e.message)}</div>`;
   }
 }
-addEventListener('hashchange', route);
+addEventListener('hashchange', () => route());
 async function updateBadge() {
   const n = qAll('damaged') + qAll('repairing');
   $('#repairBadge').textContent = n ? fmt(n) : '';
 }
 
 /* ================= DASHBOARD ================= */
-async function dashboard() {
-  const range = +(sessionGet('dashDays') || 7);
-  const d = await api('dashboard', null, '&days=' + range);
+async function dashboard(d) {
+  const range = dashDays();
   S.stock = d.stock; S.dept = d.dept;
   const sts = ['available', 'issued', 'damaged', 'repairing'];
   const total = sts.reduce((a, s) => a + qAll(s), 0);
@@ -430,7 +454,7 @@ async function dashboard() {
   <div class="reset-topbar"><button class="btn btn-bad" id="resetBtn">🗑 รีเซ็ตข้อมูล / Reset data</button></div>
   <div class="hero">
     <div class="leafs">${[12, 30, 48, 66, 84].map((l, i) => `<i class="fa-solid fa-leaf" style="left:${l}%;bottom:-20px;font-size:${18 + i * 6}px;animation-delay:${-i * 2.6}s"></i>`).join('')}</div>
-    <div class="greet"><i class="fa-solid ${greet[1]}"></i>${greet[0]}${S.me ? ' คุณ' + esc(S.me.fullname || S.me.username) : ''} · ${new Date().toLocaleDateString('th-TH', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}</div>
+    <div class="greet"><i class="fa-solid ${greet[1]}"></i>${greet[0]}${S.user ? ' คุณ' + esc(S.user) : ''} · ${new Date().toLocaleDateString('th-TH', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}</div>
     <h2><span class="t-rm">RM</span> + <span class="t-pk">PK</span> + <span class="t-fg">FG</span> ระบบบริหารพาเลท</h2>
     <p>รับเข้า · เบิกจ่าย · ซ่อม · คงเหลือ</p>
     <div class="hero-stats">
@@ -618,7 +642,7 @@ const LOGACT = {
 };
 async function logs() {
   const n = nowParts();
-  let cat = '';
+  let cat = '', items = null, loadedWith = '';
   view.innerHTML = `
     <div class="log-kpi" id="logKpi"></div>
     <div class="card">
@@ -632,9 +656,7 @@ async function logs() {
       <div id="lRes"><div class="spinner"></div></div>
     </div>`;
   const params = (withCat = true) => '&' + new URLSearchParams({ from: $('#lFrom').value, to: $('#lTo').value, q: $('#lQ').value, cat: withCat ? cat : '' });
-  const load = async () => {
-    $('#lRes').innerHTML = '<div class="spinner"></div>';
-    const { items } = await api('logs', null, params(false));
+  const show = () => {
     const cnt = k => items.filter(i => i.category === k).length;
     $('#logKpi').innerHTML = [['', 'ทั้งหมด', 'fa-list', '#1d1d1f', items.length], ...Object.entries(LOGCAT).map(([k, [nm, ic]]) => [k, nm, ic, { pallet: '#0ea5e9', repair: '#7a5af8', setting: '#1d1d1f', warn: '#f79009', account: '#E2231A' }[k], cnt(k)])]
       .map(([k, nm, ic, c, v]) => `<div class="lk ${k === cat ? 'on' : ''}" data-cat="${k}" style="--c:${c}"><b>${fmt(v)}</b><span><i class="fa-solid ${ic}"></i>${nm}</span></div>`).join('');
@@ -651,11 +673,23 @@ async function logs() {
             <div class="ai"><i class="fa-solid ${ac?.icon || LOGACT[i.action] || cc[1]}"></i></div>
             <div class="tx"><p>${esc(i.detail)}</p>
               <div class="mt2"><span><i class="fa-solid fa-tag"></i> ${cc[0]}</span>${i.ref ? `<span><i class="fa-solid fa-hashtag"></i> ${esc(i.ref)}</span>` : ''}
-              <span class="by" title="ผู้ทำรายการ / By"><i class="fa-solid fa-user-check"></i> ผู้ทำรายการ / By: <b>${i.actor ? esc(i.actor) : i.username ? esc(i.username) + ' <span class="legacy">(ยังไม่เข้าสู่ระบบ)</span>' : '<span class="legacy">ไม่ระบุ (ข้อมูลเดิม)</span>'}</b></span><span><i class="fa-solid fa-network-wired"></i> ${esc(i.ip)}</span></div></div>
+              <span class="by" title="ผู้ทำรายการ / By"><i class="fa-solid fa-user-check"></i> ผู้ทำรายการ / By: <b>${i.actor ? esc(i.actor) : i.username ? esc(i.username) : '<span class="legacy">ไม่ระบุ</span>'}</b></span><span><i class="fa-solid fa-network-wired"></i> ${esc(i.ip)}</span></div></div>
             <div class="tm">${i.created_at.slice(11, 16)} น.</div></div>`;
         }).join('')}</div></div>`).join('');
   };
-  view.onclick = e => { const c = e.target.closest('[data-cat]'); if (c) { cat = c.dataset.cat; load(); } };
+  const load = async () => {
+    $('#lRes').innerHTML = '<div class="spinner"></div>';
+    try {
+      const q = params(false);
+      ({ items } = await logsApi('logs', q));
+      loadedWith = q;
+      show();
+    } catch (e) {
+      $('#lRes').innerHTML = `<div class="empty"><i class="fa-solid fa-lock"></i>${esc(e.message)}</div>`;
+    }
+  };
+  // เปลี่ยนหมวด: ใช้ผลที่โหลดไว้แล้ว (กรองในหน้า) — โหลดใหม่เฉพาะเมื่อตัวกรองวันที่/คำค้นเปลี่ยน
+  view.onclick = e => { const c = e.target.closest('[data-cat]'); if (c) { cat = c.dataset.cat; if (items && params(false) === loadedWith) show(); else load(); } };
   $('#lGo').onclick = load;
   $('#lQ').onkeydown = e => e.key === 'Enter' && load();
   $('#lCsv').onclick = () => downloadCsv('logs_export', params());
@@ -663,8 +697,8 @@ async function logs() {
 }
 
 /* ================= TRANSACTION FORMS ================= */
-// ชื่อที่เซิร์ฟเวอร์จะบันทึกเป็นผู้ทำรายการ: "ชื่อ (username)"
-const meLabel = () => S.me ? (S.me.fullname ? `${S.me.fullname} (${S.me.username})` : S.me.username) : '';
+// ชื่อที่จะบันทึกเป็นผู้ทำรายการ (ตั้งที่มุมขวาบน)
+const meLabel = () => S.user || 'ไม่ระบุ (ตั้งชื่อที่มุมขวาบน)';
 const TX = {
   receive: { from: null, to: 'available', btn: 'btn-ok', icon: 'fa-truck-ramp-box', label: 'บันทึกรับเข้า', color: '#12b76a' },
   issue:   { from: 'available', to: 'issued', btn: 'btn-primary', icon: 'fa-dolly', label: 'ยืนยันเบิกจ่าย', color: '#0ea5e9', dept: true },
@@ -752,6 +786,8 @@ function txForm(kind) {
   const setQty = n => { f.qty = Math.max(1, Math.min(9999, n | 0)); $('#qty').value = f.qty; refresh(); };
 
   renderTypes(); refresh();
+  // ข้อมูลใหม่จากเซิร์ฟเวอร์ระหว่างกรอก: อัปเดตยอดคงเหลือโดยไม่ล้างสิ่งที่เลือกไว้
+  S.onFresh = () => { renderTypes(); renderSizes(); refresh(); };
   view.onclick = e => {
     const tEl = e.target.closest('[data-t]'), sEl = e.target.closest('[data-s]'), dEl = e.target.closest('[data-d]');
     const qb = e.target.closest('[data-q]'), qs = e.target.closest('[data-set]'), cEl = e.target.closest('[data-cond]');
@@ -770,7 +806,7 @@ function txForm(kind) {
     const btn = $('#submit');
     btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> กำลังบันทึก...';
     try {
-      const r = await api(kind, { ...f, date: $('#fDate').value, time: $('#fTime').value, person: $('#fPerson').value, note: $('#fNote').value, cause: $('#fCause')?.value || '' });
+      const r = await writeApi(kind, { ...f, date: $('#fDate').value, time: $('#fTime').value, person: $('#fPerson').value, note: $('#fNote').value, cause: $('#fCause')?.value || '' });
       confetti();
       const t = typeById(f.type_id);
       modal(`<div class="success-ic"><i class="fa-solid fa-check"></i></div>
@@ -784,7 +820,7 @@ function txForm(kind) {
           <div class="srow"><span>ผู้ทำรายการ</span><b>${esc(meLabel())}</b></div></div>
         <div class="modal-acts"><button class="btn btn-ghost" data-close onclick="location.hash='dashboard'"><i class="fa-solid fa-gauge-high"></i>แดชบอร์ด</button>
         <button class="btn btn-primary" data-close><i class="fa-solid fa-plus"></i>ทำรายการต่อ</button></div>`);
-      // ปิดหน้าต่างด้วยวิธีใดก็ตาม → โหลดฟอร์มใหม่ (ยอดคงเหลือ + วันเวลาปัจจุบัน)
+      // ปิดหน้าต่างด้วยวิธีใดก็ตาม → โหลดฟอร์มใหม่ (ยอดคงเหลือ + วันเวลาปัจจุบัน — มากับผลการบันทึกแล้ว)
       S.onModalClose = () => { if (location.hash.slice(1) === kind) route(); };
     } catch (e) {
       toast(e.message, 'err');
@@ -795,8 +831,7 @@ function txForm(kind) {
 }
 
 /* ================= REPAIR ================= */
-async function repair() {
-  const { items } = await api('repairs');
+async function repair({ items }) {
   const cols = [
     ['damaged', 'ชำรุด / รอซ่อม', 'fa-heart-crack', 'c-damaged', items.filter(i => i.stage === 'damaged')],
     ['repairing', 'กำลังซ่อม', 'fa-screwdriver-wrench', 'c-repairing', items.filter(i => i.stage === 'repairing')],
@@ -857,11 +892,11 @@ function repairAction(r, act) {
       <div class="field full"><label>${meta[3]}</label><input id="mPerson" value="${act === 'repair_done' ? esc(r.repairer || '') : ''}"></div>
       <div class="field full"><label>หมายเหตุ</label><input id="mNote"></div>
     </div>
-    <p class="hint" style="font-size:12.5px;margin-top:10px"><i class="fa-solid fa-user-check" style="color:var(--ok)"></i> ผู้ทำรายการ: <b>${esc(meLabel())}</b> (บันทึกจากบัญชีที่เข้าสู่ระบบ)</p>
+    <p class="hint" style="font-size:12.5px;margin-top:10px"><i class="fa-solid fa-user-check" style="color:var(--ok)"></i> ผู้ทำรายการ: <b>${esc(meLabel())}</b> (ชื่อผู้ใช้งานมุมขวาบน)</p>
     <div class="modal-acts"><button class="btn btn-ghost" data-close>ยกเลิก</button><button class="btn ${meta[2]}" id="mGo"><i class="fa-solid ${meta[1]}"></i>${meta[0]}</button></div>`);
   $('#mGo', m).onclick = async () => {
     try {
-      const res = await api(act, { id: r.id, date: $('#mDate').value, time: $('#mTime').value, person: $('#mPerson').value, note: $('#mNote').value });
+      const res = await writeApi(act, { id: r.id, date: $('#mDate').value, time: $('#mTime').value, person: $('#mPerson').value, note: $('#mNote').value });
       closeModal();
       if (act === 'repair_done') confetti();
       toast(res.message);
@@ -917,7 +952,7 @@ async function stock() {
 }
 
 /* ================= HISTORY ================= */
-async function history() {
+async function history(initial) {
   const n = nowParts();
   const first = n.date.slice(0, 8) + '01';
   view.innerHTML = `<div class="card">
@@ -934,9 +969,7 @@ async function history() {
     <div id="hRes"><div class="spinner"></div></div></div>`;
   const params = () => '&' + new URLSearchParams({ from: $('#hFrom').value, to: $('#hTo').value, type: $('#hType').value, act: $('#hAct').value, dept: $('#hDept').value, q: $('#hQ').value });
   let items = [];
-  const load = async () => {
-    $('#hRes').innerHTML = '<div class="spinner"></div>';
-    ({ items } = await api('history', null, params()));
+  const show = () => {
     const tot = k => items.filter(i => i.action === k).reduce((a, i) => a + +i.qty, 0);
     $('#hRes').innerHTML = items.length ? `
       <div class="chips" style="margin-bottom:12px">${['receive', 'issue', 'return', 'damage', 'repair_done', 'scrap'].map(k => `<span class="tag act-${k}"><i class="fa-solid ${ACTIONS[k].icon}"></i>${ACTIONS[k].name} ${fmt(tot(k))}</span>`).join('')}</div>
@@ -946,9 +979,14 @@ async function history() {
         <td><span class="tcode" style="--c:${m.color}"><span class="sw"></span>${esc(m.code)}</span></td><td>${esc(m.size)}</td><td class="num"><b>${fmt(m.qty)}</b></td>
         <td style="font-size:12.5px">${m.from_status ? STATUS[m.from_status].name : 'ภายนอก'} <i class="fa-solid fa-arrow-right" style="color:var(--muted);font-size:10px"></i> <b style="color:${STATUS[m.to_status]?.c}">${STATUS[m.to_status]?.name || ''}</b></td>
         <td>${esc(m.department || '—')}</td>
-        <td class="by-cell">${m.actor ? `<i class="fa-solid fa-user-check" style="color:var(--ok)"></i> ${esc(m.actor)}` : '<span class="legacy" title="บันทึกก่อนมีระบบเข้าสู่ระบบ">— ข้อมูลเดิม</span>'}</td><td>${esc(m.person || '—')}</td><td style="max-width:240px;overflow:hidden;text-overflow:ellipsis">${esc(m.note || '')}</td>
+        <td class="by-cell">${m.actor ? `<i class="fa-solid fa-user-check" style="color:var(--ok)"></i> ${esc(m.actor)}` : '<span class="legacy">ไม่ระบุ</span>'}</td><td>${esc(m.person || '—')}</td><td style="max-width:240px;overflow:hidden;text-overflow:ellipsis">${esc(m.note || '')}</td>
         <td><div class="rec-acts"><button class="btn btn-sm btn-ghost rec-btn" data-medit="${m.id}" title="แก้ไขรายการ">✏️ แก้ไข</button><button class="btn btn-sm btn-ghost rec-btn" data-mdel="${m.id}" title="${m.repair_id ? 'ลบทั้งชุดงานซ่อม' : 'ลบรายการ'}">🗑 ลบ</button></div></td></tr>`).join('')}
       </tbody></table></div>` : '<div class="empty"><i class="fa-solid fa-magnifying-glass"></i>ไม่พบรายการตามเงื่อนไข</div>';
+  };
+  const load = async () => {
+    $('#hRes').innerHTML = '<div class="spinner"></div>';
+    ({ items } = await api('history', null, params()));
+    show();
   };
   view.onclick = e => {
     const ed = e.target.closest('[data-medit]'), dl = e.target.closest('[data-mdel]');
@@ -959,7 +997,7 @@ async function history() {
   $('#hGo').onclick = load;
   $('#hQ').onkeydown = e => e.key === 'Enter' && load();
   $('#hCsv').onclick = () => downloadCsv('export', params());
-  load();
+  if (initial) { items = initial.items; show(); } else load(); // ผลเริ่มต้นมากับการเปิดหน้า (batch)
 }
 
 /* ================= EDIT / DELETE RECORDS (รหัสรีเซ็ตข้อมูล) =================
@@ -994,7 +1032,7 @@ function editMovement(m) {
       <span class="tcode" style="--c:${m.color}"><span class="sw"></span>${esc(m.code)}</span> ${esc(m.size)} ม. ·
       ${m.from_status ? STATUS[m.from_status].name : 'ภายนอก'} → ${STATUS[m.to_status]?.name || ''}</p>
     <p class="hint" style="font-size:12.5px"><i class="fa-solid fa-circle-info"></i> เปลี่ยนรายการ / ประเภท / ขนาด / สถานะไม่ได้ — หากต้องการเปลี่ยน ให้ลบรายการนี้แล้วบันทึกใหม่</p>
-    <p class="hint" style="font-size:12.5px"><i class="fa-solid fa-user-check" style="color:var(--ok)"></i> บันทึกโดย: <b>${esc(m.actor || 'ข้อมูลเดิม (ไม่ระบุ)')}</b> · การแก้ไขนี้จะบันทึกใน Log ในนาม <b>${esc(meLabel())}</b></p>
+    <p class="hint" style="font-size:12.5px"><i class="fa-solid fa-user-check" style="color:var(--ok)"></i> บันทึกโดย: <b>${esc(m.actor || 'ไม่ระบุ')}</b> · การแก้ไขนี้จะบันทึกใน Log ในนาม <b>${esc(meLabel())}</b></p>
     ${chain ? `<p class="hint" style="font-size:12.5px;color:#7a5af8"><i class="fa-solid fa-link"></i> รายการนี้อยู่ในงานซ่อม <b>${esc(m.ticket_no || '')}</b> — แก้จำนวนจะปรับทุกรายการของใบนี้และใบแจ้งซ่อมพร้อมกัน · วันที่ต้องเรียง แจ้งชำรุด → ส่งซ่อม → ซ่อมเสร็จ/ตัดจำหน่าย</p>` : ''}
     <div class="fields mt">
       <div class="field"><label>จำนวน (ตัว)</label><input type="number" id="eQty" min="1" value="${+m.qty}"></div>
@@ -1034,7 +1072,7 @@ function editRepair(r) {
   recordForm(`<h3><i class="fa-solid fa-pen-to-square" style="color:var(--brand)"></i> แก้ไขใบแจ้งซ่อม ${esc(r.ticket_no)}</h3>
     <p style="color:var(--muted)">${esc(r.code)} · ${esc(r.size)} ม. · ${fmt(r.qty)} ตัว${r.department ? ' · ' + esc(r.department) : ''}</p>
     <p class="hint" style="font-size:12.5px"><i class="fa-solid fa-circle-info"></i> แก้ได้เฉพาะข้อความ — จำนวน / วันที่ แก้ที่รายการแจ้งชำรุดในหน้าประวัติเคลื่อนไหว (ปรับทั้งชุด) · สถานะเปลี่ยนด้วยปุ่มส่งซ่อม / ซ่อมเสร็จ</p>
-    <p class="hint" style="font-size:12.5px"><i class="fa-solid fa-user-check" style="color:var(--ok)"></i> ผู้แจ้ง: <b>${esc(r.reported_by || 'ไม่ระบุ')}</b> (บันทึกจากบัญชีผู้ใช้ แก้ไขไม่ได้)</p>
+    <p class="hint" style="font-size:12.5px"><i class="fa-solid fa-user-check" style="color:var(--ok)"></i> ผู้แจ้ง: <b>${esc(r.reported_by || 'ไม่ระบุ')}</b> (บันทึกจากชื่อผู้ใช้งาน แก้ไขไม่ได้)</p>
     <div class="fields mt">
       <div class="field full"><label>สาเหตุการชำรุด</label><input id="eCause" value="${esc(r.cause)}"></div>
       <div class="field full"><label>ช่างผู้ซ่อม</label><input id="eFix" value="${esc(r.repairer)}"></div>
@@ -1076,158 +1114,14 @@ async function settings() {
     if (i) { ic = i.dataset.ic; $$('[data-ic]').forEach(x => x.classList.toggle('sel', x === i)); }
     if (c) { col = c.dataset.col; $$('[data-col]').forEach(x => x.classList.toggle('sel', x === c)); }
     if (d && confirm('ลบฝ่ายนี้ออกจากรายการเลือก? (ประวัติเดิมยังอยู่)')) {
-      try { await api('dept_delete', { id: d.dataset.del }); toast('ลบฝ่ายแล้ว', 'info'); route(); }
+      try { await writeApi('dept_delete', { id: d.dataset.del }); toast('ลบฝ่ายแล้ว', 'info'); route(); }
       catch (err) { toast(err.message, 'err'); }
     }
   };
   $('#dSave').onclick = async () => {
-    try { const r = await api('dept_save', { name: $('#dName').value, icon: ic, color: col }); toast(r.message); route(); }
+    try { const r = await writeApi('dept_save', { name: $('#dName').value, icon: ic, color: col }); toast(r.message); route(); }
     catch (e) { toast(e.message, 'err'); }
   };
-}
-
-/* ================= ACCOUNT (ตั้งค่าบัญชี) =================
-   ทุกคน: ดูบัญชีของตนเอง + เปลี่ยนรหัสผ่าน · ผู้ดูแลระบบ: จัดการบัญชีผู้ใช้ทั้งหมด (เซิร์ฟเวอร์ตรวจสิทธิ์อีกชั้น) */
-const dtOrDash = s => s ? dtTH(s) : '—';
-async function account() {
-  const { user } = await api('me');
-  setMe(user);
-  const me = S.me, admin = isAdmin();
-  view.innerHTML = `<div class="grid g-2">
-    <div class="card"><h3><i class="fa-solid fa-id-badge"></i>บัญชีของฉัน</h3>
-      <div class="srow"><span>ชื่อผู้ใช้</span><b>${esc(me.username)}</b></div>
-      <div class="srow"><span>ชื่อ - นามสกุล</span><b>${esc(me.fullname)}</b></div>
-      <div class="srow"><span>สิทธิ์</span><b>${roleTag(me.role)}</b></div>
-      <div class="srow"><span>เข้าสู่ระบบล่าสุด</span><b>${dtOrDash(me.last_login)}</b></div>
-      <p class="hint" style="font-size:12.5px;margin-top:12px"><i class="fa-solid fa-circle-info"></i> ทุกรายการที่บันทึกจะแสดงผู้ทำรายการเป็น <b>${esc(meLabel())}</b></p>
-      <button class="btn btn-ghost mt" id="aLogout"><i class="fa-solid fa-right-from-bracket"></i>ออกจากระบบ</button>
-    </div>
-    <div class="card"><h3><i class="fa-solid fa-key"></i>เปลี่ยนรหัสผ่าน</h3>
-      <div class="field"><label>รหัสผ่านเดิม</label><input type="password" id="cpOld" autocomplete="current-password"></div>
-      <div class="field mt"><label>รหัสผ่านใหม่ (อย่างน้อย 8 ตัวอักษร)</label><input type="password" id="cpNew" autocomplete="new-password"></div>
-      <div class="field mt"><label>ยืนยันรหัสผ่านใหม่</label><input type="password" id="cpNew2" autocomplete="new-password"></div>
-      <div id="cpErr" style="color:var(--bad);min-height:20px;margin-top:8px;font-size:13px"></div>
-      <button class="btn btn-primary" id="cpGo" style="width:100%"><i class="fa-solid fa-floppy-disk"></i>เปลี่ยนรหัสผ่าน</button>
-      <p class="hint" style="font-size:12.5px;margin-top:10px">เปลี่ยนแล้ว เครื่องอื่นที่เข้าสู่ระบบด้วยบัญชีนี้จะถูกออกจากระบบ</p>
-    </div></div>
-    ${admin ? `<div class="card mt"><h3><i class="fa-solid fa-users-gear"></i>จัดการบัญชีผู้ใช้<span class="sub" id="uCount"></span></h3><div id="uList"><div class="spinner"></div></div></div>
-    <div class="card mt"><h3><i class="fa-solid fa-user-plus"></i>สร้างบัญชีใหม่</h3>
-      <div class="fields">
-        <div class="field"><label>ชื่อผู้ใช้ (a-z 0-9 . _ - · 3-30 ตัว)</label><input id="nuUser" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="30" placeholder="เช่น somchai"></div>
-        <div class="field"><label>รหัสผ่าน (อย่างน้อย 8 ตัวอักษร)</label><input type="password" id="nuPass" autocomplete="new-password"></div>
-        <div class="field"><label>สิทธิ์</label><select id="nuRole"><option value="user">ผู้ใช้งาน</option><option value="admin">ผู้ดูแลระบบ</option></select></div>
-      </div>
-      <div id="nuErr" style="color:var(--bad);min-height:20px;margin-top:8px;font-size:13px"></div>
-      <button class="btn btn-primary" id="nuGo"><i class="fa-solid fa-user-plus"></i>สร้างบัญชี</button>
-    </div>` : ''}`;
-
-  $('#aLogout').onclick = logout;
-  const busy = (b, on, html) => { b.disabled = on; if (html) b.innerHTML = html; };
-  $('#cpGo').onclick = async () => {
-    const b = $('#cpGo'), e = $('#cpErr'), o = $('#cpOld').value, n = $('#cpNew').value, n2 = $('#cpNew2').value;
-    e.textContent = '';
-    if (!o || !n) { e.textContent = 'กรุณากรอกรหัสผ่านเดิมและรหัสผ่านใหม่'; return; }
-    if (n.length < 8) { e.textContent = 'รหัสผ่านใหม่ต้องมีอย่างน้อย 8 ตัวอักษร'; return; }
-    if (n !== n2) { e.textContent = 'ยืนยันรหัสผ่านใหม่ไม่ตรงกัน'; return; }
-    busy(b, true, '<i class="fa-solid fa-spinner fa-spin"></i> กำลังบันทึก...');
-    try {
-      const r = await api('change_password', { old_password: o, new_password: n });
-      setToken(r.token);
-      ['#cpOld', '#cpNew', '#cpNew2'].forEach(s => $(s).value = '');
-      toast(r.message);
-    } catch (x) { e.textContent = x.message; }
-    busy(b, false, '<i class="fa-solid fa-floppy-disk"></i>เปลี่ยนรหัสผ่าน');
-  };
-  if (!admin) return;
-
-  let users = [];
-  const loadUsers = async () => {
-    const r = await api('users');
-    users = r.users;
-    $('#uCount').textContent = `${users.length} บัญชี · ใช้งาน ${users.filter(u => u.active).length}`;
-    $('#uList').innerHTML = `<div class="tbl-wrap"><table><thead><tr><th>ชื่อผู้ใช้</th><th>ชื่อ - นามสกุล</th><th>สิทธิ์</th><th>สถานะ</th><th>เข้าสู่ระบบล่าสุด</th><th>จัดการ</th></tr></thead><tbody>
-      ${users.map(u => `<tr class="${u.active ? '' : 'u-off'}"><td><b>${esc(u.username)}</b>${u.id === me.id ? ' <span class="tag" style="--c:#12b76a">คุณ</span>' : ''}</td><td>${esc(u.fullname)}</td><td>${roleTag(u.role)}</td>
-        <td>${u.active ? '<span class="tag" style="--c:#12b76a"><i class="fa-solid fa-circle-check"></i>ใช้งาน</span>' : '<span class="tag" style="--c:#667085"><i class="fa-solid fa-ban"></i>ปิดใช้งาน</span>'}</td>
-        <td style="white-space:nowrap">${dtOrDash(u.last_login)}</td>
-        <td><div class="u-acts"><button class="btn btn-sm btn-ghost rec-btn" data-uedit="${u.id}"><i class="fa-solid fa-user-pen"></i>แก้ไข</button>
-          <button class="btn btn-sm btn-ghost rec-btn" data-upw="${u.id}"><i class="fa-solid fa-key"></i>ตั้งรหัสใหม่</button>
-          <button class="btn btn-sm btn-ghost rec-btn" data-utog="${u.id}"><i class="fa-solid ${u.active ? 'fa-user-slash' : 'fa-user-check'}"></i>${u.active ? 'ปิดใช้งาน' : 'เปิดใช้งาน'}</button></div></td></tr>`).join('')}
-      </tbody></table></div>`;
-  };
-  const afterSelfChange = async () => { const r = await api('me'); setMe(r.user); if (!isAdmin()) return route(); };
-  const userForm = (html, onSave) => {
-    const m = modal(html + `<div id="uErr" style="color:var(--bad);min-height:20px;margin-top:8px;font-size:13px"></div>
-      <div class="modal-acts"><button class="btn btn-ghost" data-close>ยกเลิก</button><button class="btn btn-primary" id="uSave"><i class="fa-solid fa-floppy-disk"></i>บันทึก</button></div>`);
-    const go = $('#uSave', m);
-    go.onclick = async () => {
-      if (go.disabled) return;
-      busy(go, true, '<i class="fa-solid fa-spinner fa-spin"></i> กำลังบันทึก...');
-      try {
-        const r = await onSave(m);
-        closeModal(); toast(r.message, r.changed === false ? 'info' : 'ok');
-        await loadUsers();
-      } catch (x) {
-        if (x.code === 'AUTH') return;
-        $('#uErr', m).textContent = x.message;
-        busy(go, false, '<i class="fa-solid fa-floppy-disk"></i>บันทึก');
-      }
-    };
-    return m;
-  };
-  view.onclick = async e => {
-    const ed = e.target.closest('[data-uedit]'), pw = e.target.closest('[data-upw]'), tg = e.target.closest('[data-utog]');
-    const u = users.find(x => x.id === +(ed || pw || tg)?.dataset[ed ? 'uedit' : pw ? 'upw' : 'utog']);
-    if (!u) return;
-    if (ed) userForm(`<h3><i class="fa-solid fa-user-pen" style="color:var(--brand)"></i> แก้ไขบัญชี ${esc(u.username)}</h3>
-        <div class="field mt"><label>ชื่อ - นามสกุล</label><input id="ueName" maxlength="100" value="${esc(u.fullname)}"></div>
-        <div class="field mt"><label>สิทธิ์</label><select id="ueRole"><option value="user" ${u.role === 'user' ? 'selected' : ''}>ผู้ใช้งาน</option><option value="admin" ${u.role === 'admin' ? 'selected' : ''}>ผู้ดูแลระบบ</option></select></div>
-        <div class="field mt"><label>สถานะ</label><select id="ueActive"><option value="1" ${u.active ? 'selected' : ''}>ใช้งาน</option><option value="0" ${u.active ? '' : 'selected'}>ปิดใช้งาน (ออกจากระบบทุกเครื่อง)</option></select></div>`,
-      async m => {
-        const r = await api('user_save', { id: u.id, fullname: $('#ueName', m).value, role: $('#ueRole', m).value, active: $('#ueActive', m).value });
-        if (u.id === me.id) await afterSelfChange();
-        return r;
-      });
-    if (pw) userForm(`<h3><i class="fa-solid fa-key" style="color:var(--brand)"></i> ตั้งรหัสผ่านใหม่ให้ ${esc(u.username)}</h3>
-        <p style="color:var(--muted)">${esc(u.fullname)} จะถูกออกจากระบบทุกเครื่อง และต้องเข้าสู่ระบบด้วยรหัสผ่านใหม่</p>
-        <div class="field mt"><label>รหัสผ่านใหม่ (อย่างน้อย 8 ตัวอักษร)</label><input type="password" id="upNew" autocomplete="new-password"></div>
-        <div class="field mt"><label>ยืนยันรหัสผ่านใหม่</label><input type="password" id="upNew2" autocomplete="new-password"></div>`,
-      async m => {
-        const n = $('#upNew', m).value;
-        if (n.length < 8) throw new Error('รหัสผ่านใหม่ต้องมีอย่างน้อย 8 ตัวอักษร');
-        if (n !== $('#upNew2', m).value) throw new Error('ยืนยันรหัสผ่านใหม่ไม่ตรงกัน');
-        const r = await api('user_reset_password', { id: u.id, password: n });
-        if (r.token) setToken(r.token); // ตั้งรหัสใหม่ให้ตัวเอง: เครื่องนี้ยังเข้าสู่ระบบอยู่
-        return r;
-      });
-    if (tg) {
-      if (!confirm(u.active ? `ปิดใช้งานบัญชี ${u.username} (${u.fullname})?\nผู้ใช้นี้จะถูกออกจากระบบทุกเครื่องและเข้าสู่ระบบไม่ได้จนกว่าจะเปิดใช้งานอีกครั้ง` : `เปิดใช้งานบัญชี ${u.username} (${u.fullname})?`)) return;
-      try {
-        const r = await api('user_toggle', { id: u.id });
-        toast(r.message, 'info');
-        if (u.id === me.id) return authLost();
-        await loadUsers();
-      } catch (x) { if (x.code !== 'AUTH') toast(x.message, 'err'); }
-    }
-  };
-  $('#nuGo').onclick = async () => {
-    const b = $('#nuGo'), e = $('#nuErr');
-    // The account form has only username / password / role; the username doubles
-    // as the display name (an admin can still rename it via แก้ไข).
-    const username = $('#nuUser').value.trim().toLowerCase();
-    const body = { username, fullname: username, role: $('#nuRole').value, password: $('#nuPass').value };
-    e.textContent = '';
-    if (!/^[a-z0-9._-]{3,30}$/.test(body.username)) { e.textContent = 'ชื่อผู้ใช้ต้องยาว 3-30 ตัว ใช้ได้เฉพาะ a-z 0-9 . _ -'; return; }
-    if (body.password.length < 8) { e.textContent = 'รหัสผ่านต้องมีอย่างน้อย 8 ตัวอักษร'; return; }
-    busy(b, true, '<i class="fa-solid fa-spinner fa-spin"></i> กำลังสร้าง...');
-    try {
-      const r = await api('user_save', body);
-      toast(r.message);
-      ['#nuUser', '#nuPass'].forEach(s => $(s).value = '');
-      await loadUsers();
-    } catch (x) { e.textContent = x.message; }
-    busy(b, false, '<i class="fa-solid fa-user-plus"></i>สร้างบัญชี');
-  };
-  await loadUsers();
 }
 
 /* รีเซ็ตข้อมูล: ถามรหัสรีเซ็ต (ใช้ครั้งเดียว ไม่เก็บไว้) → ยืนยัน → POST reset_data */
@@ -1258,7 +1152,9 @@ function resetData() {
     if (!confirm(RESET_CONFIRM)) { inp.focus(); return; }
     go.disabled = true; go.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> กำลังรีเซ็ต...'; err.textContent = '';
     try {
-      const r = await gasPost({ action: 'reset_data', resetPassword: pw });
+      const reads = routeReads();
+      const r = await gasPost({ action: 'reset_data', resetPassword: pw, ...readsField(reads) });
+      afterWrite(r, reads);
       pw = ''; inp.value = '';
       closeModal();
       const c = r.removed || {};
@@ -1274,4 +1170,4 @@ function resetData() {
   inp.focus();
 }
 
-start();
+route();
