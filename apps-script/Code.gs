@@ -148,7 +148,8 @@ var READ_ACTIONS = ["bootstrap", "dashboard", "repairs", "history", "export", "l
 var WRITE_ACTIONS = ["receive", "issue", "return", "damage", "repair_start", "repair_done", "scrap", "dept_save", "dept_delete"];
 // Account actions that write (POST, session required, run under the script lock).
 var ACCOUNT_ACTIONS = ["logout", "change_password", "user_save", "user_reset_password", "user_toggle"];
-var ADMIN_ACTIONS = ["users", "user_save", "user_reset_password", "user_toggle"];
+// The audit log (who did what) is visible to administrators only.
+var ADMIN_ACTIONS = ["users", "user_save", "user_reset_password", "user_toggle", "logs", "logs_export"];
 var POST_ONLY_ACTIONS = ["login", "verifyResetPassword"]
   .concat(WRITE_ACTIONS, RESET_PASSWORD_ACTIONS, ACCOUNT_ACTIONS);
 

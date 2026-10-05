@@ -1,4 +1,4 @@
-# Pallet Hub — ระบบบริหารพาเลท RM + PK + FG (ราชบุรี)
+# Pallet Hub — ระบบบริหารพาเลท RM + PK + FG
 
 เวอร์ชัน GitHub Pages + Google Apps Script (ย้ายมาจากเวอร์ชัน PHP/MySQL บน XAMPP)
 

@@ -296,7 +296,11 @@ document.addEventListener('animationend', e => {
 const ROLE = { admin: ['ผู้ดูแลระบบ', '#E2231A', 'fa-user-shield'], user: ['ผู้ใช้งาน', '#0ea5e9', 'fa-user'] };
 const roleTag = r => { const x = ROLE[r] || [r, '#667085', 'fa-user']; return `<span class="tag" style="--c:${x[1]}"><i class="fa-solid ${x[2]}"></i>${esc(x[0])}</span>`; };
 const isAdmin = () => S.me?.role === 'admin';
-function setMe(u) { S.me = u || null; paintUser(); }
+function setMe(u) {
+  S.me = u || null; paintUser();
+  // บันทึกประวัติ (Log) เห็นเฉพาะผู้ดูแลระบบ (server ก็ตรวจสิทธิ์ด้วย)
+  $$('.nav a[data-page="logs"]').forEach(a => { a.hidden = !isAdmin(); });
+}
 function setToken(t) { authToken = t || ''; if (authToken) store('set', TOKEN_KEY, authToken); else store('del', TOKEN_KEY); }
 function paintUser() {
   const u = S.me;
@@ -375,7 +379,7 @@ async function start() {
 async function route() {
   if (!authToken || !S.me) return; // ยังไม่เข้าสู่ระบบ: หน้าเข้าสู่ระบบแสดงอยู่
   const page = (location.hash.slice(1) || 'dashboard').split('?')[0];
-  const p = PAGES[page] ? page : 'dashboard';
+  const p = PAGES[page] && !(page === 'logs' && !isAdmin()) ? page : 'dashboard';
   $$('.nav a').forEach(a => a.classList.toggle('active', a.dataset.page === p));
   $('#pageTitle').textContent = PAGES[p][0];
   $('#pageSub').textContent = PAGES[p][1];

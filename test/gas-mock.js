@@ -217,7 +217,7 @@ const AT = { date: TODAY, time: HOUR + ":00" };
 const sheet = n => state.spreadsheets[state.props.PALLET_SPREADSHEET_ID].getSheetByName(n);
 const dataRows = n => sheet(n).getLastRow() - 1;
 const stockOf = (stock, type, size, st) => ((stock[type] || {})[size] || {})[st] || 0;
-const lastLog = () => okData(get("logs")).items[0];
+const lastLog = () => okData(get("logs", {}, T.admin)).items[0];
 const userRows = () => { const d = sheet("users").data; return d.slice(1).filter(r => r.some(v => v !== "" && v != null)).map(r => Object.fromEntries(d[0].map((k, i) => [k, r[i]]))); };
 
 const ALL_READS = ["bootstrap", "dashboard", "repairs", "history", "export", "logs", "logs_export", "me", "users"];
@@ -449,7 +449,7 @@ test("receive: validation errors are rejected and logged as warn", () => {
   assert.strictEqual(log.category, "warn");
   assert.strictEqual(log.action, "receive");
   assert.strictEqual(log.ref, "");
-  const warns = okData(get("logs", { cat: "warn" })).items;
+  const warns = okData(get("logs", { cat: "warn" }, T.admin)).items;
   assert.strictEqual(warns.length, 7);
   assert.ok(warns.some(w => w.detail === "ปฏิเสธรับเข้า: จำนวนต้องมากกว่า 0"));
 });
@@ -687,15 +687,15 @@ test("export: CSV with PHP fputcsv quoting", () => {
 
 /* ---------- logs ---------- */
 test("logs: categories, filters, order and CSV export", () => {
-  const all = okData(get("logs")).items;
+  const all = okData(get("logs", {}, T.admin)).items;
   assert.strictEqual(all.length, dataRows("audit_logs"));
   for (let i = 1; i < all.length; i++) assert.ok(all[i - 1].id > all[i].id);
   const cats = new Set(all.map(i => i.category));
   ["pallet", "repair", "warn"].forEach(c => assert.ok(cats.has(c), c));
-  assert.ok(okData(get("logs", { q: "Tester" })).items.length > 0);
-  assert.ok(okData(get("logs")).items.every(l => l.category === "account" || (l.actor === TESTER && l.username === "tester")));
-  assert.strictEqual(okData(get("logs", { from: "2099-01-01" })).items.length, 0);
-  const x = okData(get("logs_export", { cat: "warn" }));
+  assert.ok(okData(get("logs", { q: "Tester" }, T.admin)).items.length > 0);
+  assert.ok(okData(get("logs", {}, T.admin)).items.every(l => l.category === "account" || (l.actor === TESTER && l.username === "tester")));
+  assert.strictEqual(okData(get("logs", { from: "2099-01-01" }, T.admin)).items.length, 0);
+  const x = okData(get("logs_export", { cat: "warn" }, T.admin));
   assert.ok(/^pallet_log_\d{8}_\d{6}\.csv$/.test(x.filename));
   const lines = x.csv.trim().split("\n");
   assert.strictEqual(lines[0], "ลำดับ,วันที่,เวลา,หมวด,เลขที่อ้างอิง,รายละเอียด,ผู้ทำรายการ,ชื่อผู้ใช้,IP");
@@ -706,8 +706,8 @@ test("logs: categories, filters, order and CSV export", () => {
 /* ---------- departments ---------- */
 test("dept_save: add new, update existing (case-insensitive), validation", () => {
   err(post("dept_save", { name: "  " }), /^กรุณาระบุชื่อฝ่าย$/);
-  const warnBefore = okData(get("logs", { cat: "warn" })).items.length;
-  assert.strictEqual(okData(get("logs", { cat: "warn" })).items.length, warnBefore); // settings errors not logged as warn
+  const warnBefore = okData(get("logs", { cat: "warn" }, T.admin)).items.length;
+  assert.strictEqual(okData(get("logs", { cat: "warn" }, T.admin)).items.length, warnBefore); // settings errors not logged as warn
   const r = okData(post("dept_save", { name: "ฝ่ายจัดซื้อ", icon: "fa-store", color: "#1E6FE0" }));
   assert.strictEqual(r.message, "เพิ่ม ฝ่ายจัดซื้อ แล้ว");
   let deps = okData(get("bootstrap")).departments;
@@ -782,9 +782,19 @@ test("every write acquires and releases the script lock; lock timeout returns er
 });
 
 test("reads work with a session (GET and POST)", () => {
-  for (const a of ["bootstrap", "dashboard", "repairs", "history", "export", "logs", "logs_export", "me"]) {
+  for (const a of ["bootstrap", "dashboard", "repairs", "history", "export", "me"]) {
     okData(get(a));
     okData(postRaw({ action: a }));
+  }
+});
+
+test("audit log (logs / logs_export) is admin-only", () => {
+  for (const a of ["logs", "logs_export"]) {
+    const r = err(get(a));
+    assert.strictEqual(r.code, "FORBIDDEN");
+    assert.strictEqual(err(postRaw({ action: a })).code, "FORBIDDEN");
+    okData(get(a, {}, T.admin));
+    okData(postRaw({ action: a }, T.admin));
   }
 });
 
@@ -852,7 +862,7 @@ test("reset_data success: clears movements/repairs/audit_logs (one clear per she
 });
 
 test("after reset: audit log contains exactly the reset entry", () => {
-  const items = okData(get("logs")).items;
+  const items = okData(get("logs", {}, T.admin)).items;
   assert.strictEqual(items.length, 1);
   const l = items[0];
   assert.strictEqual(l.id, 1);
@@ -900,7 +910,7 @@ test("after reset: numbering restarts (RC/IS/DM/RPR -0001, ids from 1) and flows
   assert.strictEqual(stockOf(b.stock, 1, "1.2x1.2", "available"), 5);
   assert.strictEqual(stockOf(b.stock, 1, "1.2x1.2", "issued"), 4);
   assert.strictEqual(stockOf(b.stock, 1, "1.2x1.2", "damaged"), 1);
-  const logs = okData(get("logs")).items;
+  const logs = okData(get("logs", {}, T.admin)).items;
   assert.deepStrictEqual(logs.map(l => l.id), [4, 3, 2, 1]);
   assert.strictEqual(logs[3].action, "รีเซ็ตข้อมูล");
 });
@@ -909,7 +919,7 @@ test("reset_data on already-empty sheets reports zero rows removed", () => {
   okData(reset(RPW));
   const r = okData(reset(RPW));
   assert.deepStrictEqual(r.removed, { movements: 0, repairs: 0, audit_logs: 1 });
-  assert.strictEqual(okData(get("logs")).items.length, 1);
+  assert.strictEqual(okData(get("logs", {}, T.admin)).items.length, 1);
 });
 
 /* ---------- edit / delete records (reset password) ---------- */
@@ -1248,7 +1258,7 @@ test("actor is decided by the server: fake person/actor/reported_by from the cli
   const t2 = ticketOf(t.id);
   assert.deepStrictEqual([t2.reported_by, t2.updated_by, t2.updated_username, t2.repairer], [EDITOR, TESTER, "tester", "Tester"]);
   assert.strictEqual(byDoc(rp.doc_no).actor, TESTER);
-  const logs = okData(get("logs")).items.slice(0, 3);
+  const logs = okData(get("logs", {}, T.admin)).items.slice(0, 3);
   assert.deepStrictEqual(logs.map(l => l.actor), [TESTER, EDITOR, EDITOR]);
   assert.ok(!JSON.stringify(state.spreadsheets[state.props.PALLET_SPREADSHEET_ID].sheets.map(x => x.data)).includes("Hacker"));
   okData(rec("repair_delete", { id: t.id })); // tidy up
@@ -1455,7 +1465,7 @@ test("docs JS files parse (new Function)", () => {
   assert.ok(app.includes("resetPassword: pw }"));
   assert.ok(/data-medit=.*✏️ แก้ไข/.test(app) && /data-mdel=.*🗑 ลบ/.test(app) && /data-redit=.*data-rdel=/.test(app));
   const html = fs.readFileSync(path.join(ROOT, "docs/index.html"), "utf8");
-  assert.ok(html.includes('assets/app.js?v=16"'));
+  assert.ok(html.includes('assets/app.js?v=17"'));
   assert.ok(html.includes('id="loginScreen"') && html.includes('data-page="account"'));
   assert.ok(!/verifyPassword'|actionPassword|palletUser/.test(app)); // old shared password / typed-name features removed
   for (const a of ["login", "logout", "me", "change_password", "users", "user_save", "user_reset_password", "user_toggle"]) assert.ok(app.includes(`'${a}'`), a);
