@@ -283,10 +283,10 @@ test("no login: reads and normal writes work without any password or session (ol
     okData(get(a, { token: "f".repeat(64) }));
   }
   const deps = okData(get("bootstrap")).departments;
-  const d = okData(postRaw({ action: "dept_save", name: "ฝ่ายผลิต", icon: "fa-industry", color: "#E2231A", token: "garbage", password: "x" }, null));
+  const d = okData(postRaw({ action: "dept_save", name: "ฝ่ายผลิต", icon: "fa-industry", color: "#E2231A", token: "garbage", password: "x", actor: "Tester" }, null));
   assert.strictEqual(d.message, "เพิ่ม ฝ่ายผลิต แล้ว");
   assert.deepStrictEqual(okData(get("bootstrap")).departments, deps);
-  err(postRaw({ action: "dept_delete", id: 999 }, null), /^ไม่พบฝ่าย$/);
+  err(postRaw({ action: "dept_delete", id: 999, actor: "Tester" }, null), /^ไม่พบฝ่าย$/);
   assert.ok(!sheet("users"), "no users sheet is created");
 });
 
@@ -1160,7 +1160,7 @@ test("deleting the last data rows keeps a spare sheet row (Sheets cannot delete 
 });
 
 /* ---------- attribution (name typed in the page header) ---------- */
-test("actor = the typed name (trimmed, max 100, optional); person / reported_by from the client never replace it", () => {
+test("actor = the typed name (trimmed, max 100, required); person / reported_by from the client never replace it", () => {
   const d = okData(postRaw(Object.assign({ action: "receive", type_id: 3, size: "1.2x1.2", qty: 5, username: "admin", person: "ใครก็ได้" }, AT), "  สมชาย ใจดี  "));
   let m = byDoc(d.doc_no);
   assert.deepStrictEqual([m.actor, m.username, m.person], ["สมชาย ใจดี", "", "ใครก็ได้"]);
@@ -1174,11 +1174,15 @@ test("actor = the typed name (trimmed, max 100, optional); person / reported_by 
   const t2 = ticketOf(t.id);
   assert.deepStrictEqual([t2.reported_by, t2.updated_by, t2.updated_username, t2.repairer], [EDITOR, TESTER, "", TESTER]);
   assert.strictEqual(byDoc(rp.doc_no).actor, TESTER);
-  // no name typed: recorded as empty; objects are ignored; long names are cut at 100 characters
-  const n1 = okData(post("receive", Object.assign({ type_id: 3, size: "1.2x1.2", qty: 1 }, AT), null));
-  assert.strictEqual(byDoc(n1.doc_no).actor, "");
-  const n2 = okData(postRaw(Object.assign({ action: "receive", type_id: 3, size: "1.2x1.2", qty: 1, actor: { x: 1 } }, AT), null));
-  assert.strictEqual(byDoc(n2.doc_no).actor, "");
+  // no name typed (missing, blank or not a string): refused, nothing written; long names are cut at 100 characters
+  const before = dataRows("movements");
+  for (const actor of [undefined, "   ", { x: 1 }]) {
+    const body = Object.assign({ action: "receive", type_id: 3, size: "1.2x1.2", qty: 1 }, AT);
+    if (actor !== undefined) body.actor = actor;
+    const r = err(postRaw(body, null), /กรุณาระบุชื่อผู้ใช้งาน/);
+    assert.strictEqual(r.code, "NAME_REQUIRED");
+  }
+  assert.strictEqual(dataRows("movements"), before, "no movement written without a name");
   const n3 = okData(post("receive", Object.assign({ type_id: 3, size: "1.2x1.2", qty: 1 }, AT), "ก".repeat(150)));
   assert.strictEqual(byDoc(n3.doc_no).actor, "ก".repeat(100));
   // refused writes are logged with the typed name too
@@ -1506,7 +1510,7 @@ test("docs JS files parse (new Function); no login UI; reset password never stor
   assert.ok(!/palletRC[^\n]*logs/.test(app));
   assert.ok(app.includes("ผู้ทำรายการ / By"));
   const html = fs.readFileSync(path.join(ROOT, "docs/index.html"), "utf8");
-  assert.ok(html.includes('assets/app.js?v=18"'));
+  assert.ok(html.includes('assets/app.js?v=19"'));
   assert.ok(!html.includes('id="loginScreen"') && !html.includes('data-page="account"') && !html.includes("umLogout"));
   assert.ok(html.includes('id="userChip"') && html.includes('data-page="logs"'));
   assert.ok(/<link rel="preconnect" href="https:\/\/script\.google\.com"/.test(html) && /script\.googleusercontent\.com/.test(html));

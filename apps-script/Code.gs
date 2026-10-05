@@ -198,6 +198,8 @@ function doPost(e) {
     if (WRITE_ACTIONS.indexOf(action) === -1 && RESET_PASSWORD_ACTIONS.indexOf(action) === -1) fail_("Unknown action");
     // Optional reads to return with the write result (validated before writing).
     if (payload.reads != null && payload.reads !== "") reads = parseReads_(payload.reads);
+    // Every change must say who made it (name set in the page header).
+    if (!actorIn_(payload)) fail_("กรุณาระบุชื่อผู้ใช้งาน (มุมขวาบน) ก่อนบันทึก", "NAME_REQUIRED");
     // reset_data and record edits/deletes need the reset password. Checked
     // before taking the lock so guessing (1 s delay) never blocks writers.
     if (RESET_PASSWORD_ACTIONS.indexOf(action) !== -1) assertResetPassword_(payload.resetPassword);

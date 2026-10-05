@@ -65,8 +65,15 @@ function gasGet(action, params = '') {
   u.searchParams.set('_', Date.now());
   return gasFetch(u.toString(), { method: 'GET' });
 }
-function gasPost(payload) {
-  if (!API_URL) return Promise.reject(new Error(NO_API_MSG));
+// Actions that change data: the user's name (top-right) must be set first.
+const NAME_REQUIRED = ['receive', 'issue', 'return', 'damage', 'repair_start', 'repair_done', 'scrap', 'dept_save', 'dept_delete',
+  'movement_update', 'movement_delete', 'repair_update', 'repair_delete', 'reset_data'];
+async function gasPost(payload) {
+  if (!API_URL) throw new Error(NO_API_MSG);
+  if (NAME_REQUIRED.includes(payload.action) && !S.user) {
+    await askUserName(true);
+    if (!S.user) throw new Error('กรุณาระบุชื่อผู้ใช้งาน (มุมขวาบน) ก่อนบันทึก');
+  }
   return gasFetch(API_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=UTF-8' }, body: JSON.stringify({ actor: S.user || '', ...payload }) });
 }
 async function api(action, body, params = '') {
@@ -348,16 +355,31 @@ function paintUser() {
   $('#userName').textContent = S.user || 'ระบุชื่อผู้ใช้';
   $('#userAv').innerHTML = S.user ? esc(S.user.trim().charAt(0)) : '<i class="fa-solid fa-user"></i>';
 }
-$('#userChip').onclick = () => {
+// required = opened because a save needs a name: don't re-render the page
+// (keeps what the user typed in the form) and resolve when the dialog closes.
+function askUserName(required = false) {
+  return new Promise(resolve => {
   const m = modal(`<h3><i class="fa-solid fa-user-pen" style="color:var(--brand)"></i> ผู้ใช้งาน</h3>
-    <p style="color:var(--muted)">ชื่อนี้จะถูกบันทึกเป็น “ผู้ทำรายการ” ในประวัติและ Log ทุกรายการ</p>
+    <p style="color:var(--muted)">${required ? '<b style="color:var(--bad)">กรุณาระบุชื่อผู้ใช้งานก่อนบันทึกรายการ</b> · ' : ''}ชื่อนี้จะถูกบันทึกเป็น “ผู้ทำรายการ” ในประวัติและ Log ทุกรายการ</p>
     <div class="field mt"><label>ชื่อ - นามสกุล</label><input id="uName" value="${esc(S.user)}" placeholder="เช่น สมชาย ใจดี"></div>
     <div class="modal-acts"><button class="btn btn-ghost" data-close>ยกเลิก</button><button class="btn btn-primary" id="uSave"><i class="fa-solid fa-check"></i>บันทึก</button></div>`);
   const inp = $('#uName', m); inp.focus(); inp.select();
-  const save = () => { S.user = inp.value.trim().slice(0, 60); store('set', 'palletUser', S.user); paintUser(); closeModal(); toast(S.user ? `สวัสดีคุณ${S.user}` : 'ล้างชื่อผู้ใช้แล้ว', 'info'); route(); };
+  let done = false;
+  const finish = () => { if (!done) { done = true; resolve(S.user); } };
+  const save = () => {
+    const name = inp.value.trim().slice(0, 60);
+    if (required && !name) { inp.focus(); return; }
+    S.user = name; store('set', 'palletUser', S.user); paintUser(); closeModal(); finish();
+    toast(S.user ? `สวัสดีคุณ${S.user}` : 'ล้างชื่อผู้ใช้แล้ว', 'info');
+    if (!required) route();
+  };
   $('#uSave', m).onclick = save;
   inp.onkeydown = e => e.key === 'Enter' && save();
-};
+  // Cancel / backdrop close: resolve with whatever name is set (possibly none).
+  S.onModalClose = finish;
+  });
+}
+$('#userChip').onclick = () => askUserName(false);
 paintUser();
 
 /* ================= ROUTER ================= */
