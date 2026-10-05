@@ -96,9 +96,9 @@ async function recordApi(action, body, reads = routeReads()) {
 }
 const PW_KIND = {
   record: {
-    title: 'รหัสรีเซ็ตข้อมูล (แก้ไข / ลบรายการ / ดู Log)', label: 'รหัสรีเซ็ตข้อมูล', icon: 'fa-user-shield',
-    desc: 'การแก้ไขหรือลบรายการที่บันทึกแล้ว และการดูบันทึกประวัติ (Log) ต้องใช้รหัสรีเซ็ตข้อมูล (ตั้งโดยผู้ดูแลระบบ · ถามครั้งเดียวต่อการเปิดหน้านี้)',
-    cancel: 'ยกเลิก — ต้องใส่รหัสรีเซ็ตข้อมูลก่อนแก้ไข/ลบรายการ หรือดู Log',
+    title: 'รหัสผ่าน (แก้ไข / ลบรายการ / Log / ตั้งค่าฝ่าย)', label: 'รหัสรีเซ็ตข้อมูล', icon: 'fa-user-shield',
+    desc: 'การแก้ไขหรือลบรายการที่บันทึกแล้ว การดูบันทึกประวัติ (Log) และการตั้งค่าฝ่าย ต้องใช้รหัสผ่าน (ตั้งโดยผู้ดูแลระบบ · ถามครั้งเดียวต่อการเปิดหน้านี้)',
+    cancel: 'ยกเลิก — ต้องใส่รหัสผ่านก่อนแก้ไข/ลบรายการ ดู Log หรือตั้งค่าฝ่าย',
     get: () => recordPassword, set: v => { recordPassword = v; },
     verify: pw => gasPost({ action: 'verifyResetPassword', resetPassword: pw }),
   },
@@ -406,8 +406,20 @@ view.addEventListener('pointerdown', e => { if (e.target.closest('button, input,
 const sigOf = res => JSON.stringify(res.map((d, i) => (i ? d : { ...d, now: null })));
 let routeSeq = 0;
 /* แสดงข้อมูลล่าสุดที่แคชไว้ทันที (ถ้ามี) แล้วโหลดจากเซิร์ฟเวอร์ในคำขอเดียว (batch) — วาดใหม่เฉพาะเมื่อข้อมูลเปลี่ยน */
+// Pages behind the reset password, and pages that need the user's name first.
+const PW_PAGES = ['logs', 'settings'];
+const NAME_PAGES = ['receive', 'issue', 'return', 'damage', 'repair'];
 async function route() {
   const p = currentPage();
+  if (PW_PAGES.includes(p)) {
+    try { await askPassword('record'); }
+    catch (e) { toast(e.message, 'err'); if (currentPage() === p) location.hash = 'dashboard'; return; }
+  }
+  if (NAME_PAGES.includes(p) && !S.user) {
+    await askUserName(true);
+    if (!S.user) { toast('กรุณาระบุชื่อผู้ใช้งาน (มุมขวาบน) ก่อนทำรายการ', 'err'); if (currentPage() === p) location.hash = 'dashboard'; return; }
+  }
+  if (currentPage() !== p) return; // เปลี่ยนหน้าไประหว่างรอรหัส/ชื่อ
   $$('.nav a').forEach(a => a.classList.toggle('active', a.dataset.page === p));
   $('#pageTitle').textContent = PAGES[p][0];
   $('#pageSub').textContent = PAGES[p][1];
@@ -1136,12 +1148,12 @@ async function settings() {
     if (i) { ic = i.dataset.ic; $$('[data-ic]').forEach(x => x.classList.toggle('sel', x === i)); }
     if (c) { col = c.dataset.col; $$('[data-col]').forEach(x => x.classList.toggle('sel', x === c)); }
     if (d && confirm('ลบฝ่ายนี้ออกจากรายการเลือก? (ประวัติเดิมยังอยู่)')) {
-      try { await writeApi('dept_delete', { id: d.dataset.del }); toast('ลบฝ่ายแล้ว', 'info'); route(); }
+      try { await recordApi('dept_delete', { id: d.dataset.del }); toast('ลบฝ่ายแล้ว', 'info'); route(); }
       catch (err) { toast(err.message, 'err'); }
     }
   };
   $('#dSave').onclick = async () => {
-    try { const r = await writeApi('dept_save', { name: $('#dName').value, icon: ic, color: col }); toast(r.message); route(); }
+    try { const r = await recordApi('dept_save', { name: $('#dName').value, icon: ic, color: col }); toast(r.message); route(); }
     catch (e) { toast(e.message, 'err'); }
   };
 }

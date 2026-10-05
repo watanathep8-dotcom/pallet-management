@@ -47,7 +47,8 @@ var RECORD_ACT_NAME = {
   movement_update: "แก้ไขรายการ", movement_delete: "ลบรายการ",
   repair_update: "แก้ไขใบแจ้งซ่อม", repair_delete: "ลบใบแจ้งซ่อม"
 };
-var RESET_PASSWORD_ACTIONS = [RESET_ACTION, "movement_update", "movement_delete", "repair_update", "repair_delete"];
+// Department settings are also behind the reset password.
+var RESET_PASSWORD_ACTIONS = [RESET_ACTION, "movement_update", "movement_delete", "repair_update", "repair_delete", "dept_save", "dept_delete"];
 // Reading the audit log also needs the reset password (POST only, so the
 // password never travels in a URL).
 var LOG_ACTIONS = ["logs", "logs_export"];

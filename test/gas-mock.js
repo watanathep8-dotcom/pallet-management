@@ -219,7 +219,9 @@ const postRaw = (payload, who = T.tester) =>
   JSON.parse(ctx.doPost({ postData: { contents: JSON.stringify(Object.assign(who ? { actor: who } : {}, payload)) } }).getContent());
 const PW = "s3cret-Pallet"; // just some other password (never the reset password)
 const TESTER = "Tester", EDITOR = "Editor", ADMIN = "Admin";
-const post = (action, body = {}, who = T.tester) => postRaw(Object.assign({}, body, { action }), who);
+// Department settings sit behind the reset password: tests send it by default.
+const DEPT_ACTIONS = ["dept_save", "dept_delete"];
+const post = (action, body = {}, who = T.tester) => postRaw(Object.assign(DEPT_ACTIONS.includes(action) ? { resetPassword: RPW } : {}, body, { action }), who);
 const okData = (res) => { assert.strictEqual(res.ok, true, "expected ok, got: " + JSON.stringify(res)); return res.data; };
 const err = (res, re) => {
   assert.strictEqual(res.ok, false, "expected error, got: " + JSON.stringify(res));
@@ -283,10 +285,10 @@ test("no login: reads and normal writes work without any password or session (ol
     okData(get(a, { token: "f".repeat(64) }));
   }
   const deps = okData(get("bootstrap")).departments;
-  const d = okData(postRaw({ action: "dept_save", name: "ฝ่ายผลิต", icon: "fa-industry", color: "#E2231A", token: "garbage", password: "x", actor: "Tester" }, null));
+  const d = okData(postRaw({ action: "dept_save", name: "ฝ่ายผลิต", icon: "fa-industry", color: "#E2231A", token: "garbage", password: "x", actor: "Tester", resetPassword: RPW }, null));
   assert.strictEqual(d.message, "เพิ่ม ฝ่ายผลิต แล้ว");
   assert.deepStrictEqual(okData(get("bootstrap")).departments, deps);
-  err(postRaw({ action: "dept_delete", id: 999, actor: "Tester" }, null), /^ไม่พบฝ่าย$/);
+  err(postRaw({ action: "dept_delete", id: 999, actor: "Tester", resetPassword: RPW }, null), /^ไม่พบฝ่าย$/);
   assert.ok(!sheet("users"), "no users sheet is created");
 });
 
@@ -635,6 +637,13 @@ test("logs: categories, filters, order and CSV export", () => {
 
 /* ---------- departments ---------- */
 test("dept_save: add new, update existing (case-insensitive), validation", () => {
+  // without / with a wrong reset password: refused, nothing saved
+  const depsBefore = dataRows("departments");
+  err(postRaw({ action: "dept_save", name: "ไม่มีรหัส", actor: "Tester" }, null));
+  err(postRaw({ action: "dept_save", name: "รหัสผิด", actor: "Tester", resetPassword: "nope" }, null), /รหัส/);
+  err(postRaw({ action: "dept_delete", id: 1, actor: "Tester" }, null));
+  assert.strictEqual(dataRows("departments"), depsBefore);
+  clearFails();
   err(post("dept_save", { name: "  " }), /^กรุณาระบุชื่อฝ่าย$/);
   const warnBefore = okData(get("logs", { cat: "warn" })).items.length;
   assert.strictEqual(okData(get("logs", { cat: "warn" })).items.length, warnBefore); // settings errors not logged as warn
@@ -1510,7 +1519,7 @@ test("docs JS files parse (new Function); no login UI; reset password never stor
   assert.ok(!/palletRC[^\n]*logs/.test(app));
   assert.ok(app.includes("ผู้ทำรายการ / By"));
   const html = fs.readFileSync(path.join(ROOT, "docs/index.html"), "utf8");
-  assert.ok(html.includes('assets/app.js?v=19"'));
+  assert.ok(html.includes('assets/app.js?v=20"'));
   assert.ok(!html.includes('id="loginScreen"') && !html.includes('data-page="account"') && !html.includes("umLogout"));
   assert.ok(html.includes('id="userChip"') && html.includes('data-page="logs"'));
   assert.ok(/<link rel="preconnect" href="https:\/\/script\.google\.com"/.test(html) && /script\.googleusercontent\.com/.test(html));
