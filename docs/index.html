@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#B5121B">
+  <title>Pallet Hub · ระบบบริหารพาเลท</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23E2231A'/%3E%3Cpath d='M12 22h40v6H12zM12 34h40v6H12zM14 44h8v8h-8zM28 44h8v8h-8zM42 44h8v8h-8z' fill='%23fff'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Kanit:wght@300;400;500;600;700;800&family=Prompt:wght@300;400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+  <link rel="stylesheet" href="assets/style.css?v=10">
+  <style>
+    .cfg-banner{display:flex;align-items:center;gap:12px;margin:0 0 18px;padding:14px 18px;border-radius:16px;background:#fff1f0;border:2px solid var(--brand);color:var(--brand3);box-shadow:var(--shadow)}
+    .cfg-banner[hidden]{display:none}
+    .cfg-banner i{font-size:22px;color:var(--brand)}
+    .cfg-banner code{background:#fff;padding:1px 6px;border-radius:6px}
+  </style>
+</head>
+<body>
+  <!-- พื้นหลังเคลื่อนไหว -->
+  <div class="bg">
+    <span class="blob b1"></span><span class="blob b2"></span><span class="blob b3"></span><span class="blob b4"></span>
+    <div class="grid-lines"></div>
+  </div>
+
+  <aside class="sidebar" id="sidebar">
+    <a class="brand" href="#dashboard">
+      <div class="brand-icon"><i class="fa-solid fa-pallet"></i></div>
+      <div>
+        <div class="brand-name">Pallet<span>Hub</span></div>
+        <div class="brand-sub">RM + PK + FG (ราชบุรี)</div>
+      </div>
+    </a>
+    <nav class="nav">
+      <a href="#dashboard" data-page="dashboard"><i class="fa-solid fa-gauge-high"></i><span>แดชบอร์ด</span></a>
+      <div class="nav-label">ทำรายการ</div>
+      <a href="#receive" data-page="receive"><i class="fa-solid fa-truck-ramp-box"></i><span>รับเข้า</span></a>
+      <a href="#issue" data-page="issue"><i class="fa-solid fa-dolly"></i><span>เบิกจ่าย</span></a>
+      <a href="#return" data-page="return"><i class="fa-solid fa-rotate-left"></i><span>รับคืน</span></a>
+      <a href="#damage" data-page="damage"><i class="fa-solid fa-triangle-exclamation"></i><span>แจ้งชำรุด</span></a>
+      <a href="#repair" data-page="repair"><i class="fa-solid fa-screwdriver-wrench"></i><span>งานซ่อม</span><b class="badge" id="repairBadge"></b></a>
+      <div class="nav-label">รายงาน</div>
+      <a href="#stock" data-page="stock"><i class="fa-solid fa-boxes-stacked"></i><span>คงเหลือ</span></a>
+      <a href="#history" data-page="history"><i class="fa-solid fa-right-left"></i><span>ประวัติเคลื่อนไหว</span></a>
+      <a href="#logs" data-page="logs"><i class="fa-solid fa-clipboard-list"></i><span>บันทึกประวัติ (Log)</span></a>
+      <a href="#settings" data-page="settings"><i class="fa-solid fa-sitemap"></i><span>ตั้งค่าฝ่าย</span></a>
+    </nav>
+    <div class="side-foot">
+      <div class="legend-mini">
+        <span style="--c:#1E6FE0">RM</span><span style="--c:var(--pk)">PK</span><span style="--c:var(--fg)">FG</span><span style="--c:var(--pl)">พลาสติก</span>
+      </div>
+      <small>จัดเก็บเป็นหมวดหมู่ · หยิบง่าย · ลดความเสี่ยง</small>
+    </div>
+  </aside>
+  <div class="nav-overlay" id="navOverlay"></div>
+
+  <main class="main">
+    <header class="topbar">
+      <button class="icon-btn menu-btn" id="menuBtn" aria-label="เมนู"><i class="fa-solid fa-bars"></i></button>
+      <div class="page-title">
+        <h1 id="pageTitle">แดชบอร์ด</h1>
+        <p id="pageSub">ภาพรวมพาเลททั้งหมด</p>
+      </div>
+      <div class="top-actions">
+        <div class="clock hide-sm"><i class="fa-regular fa-clock fa-spin-pulse" style="--fa-animation-duration:4s"></i><span id="clock">--:--:--</span><small id="clockDate"></small></div>
+        <button class="user-chip" id="userChip" title="ตั้งชื่อผู้ใช้งาน"><span class="av" id="userAv"><i class="fa-solid fa-user"></i></span><span class="un" id="userName">ระบุชื่อผู้ใช้</span></button>
+        <a class="btn btn-primary" href="#issue"><i class="fa-solid fa-dolly"></i> <span class="hide-sm">เบิกจ่าย</span></a>
+      </div>
+    </header>
+    <div class="cfg-banner" id="cfgBanner" hidden><i class="fa-solid fa-plug-circle-exclamation"></i><div><b>ยังไม่ได้ตั้งค่า apiUrl</b><br><small>ใส่ URL ของ Google Apps Script Web App (ลงท้ายด้วย <code>/exec</code>) ในไฟล์ <code>docs/config.js</code> แล้วโหลดหน้านี้ใหม่</small></div></div>
+    <section id="view" class="view"></section>
+  </main>
+
+  <div id="toasts" class="toasts"></div>
+  <div id="modal" class="modal" hidden><div class="modal-card" id="modalCard"></div></div>
+  <div id="pwModal" class="modal" hidden style="z-index:95"><div class="modal-card" id="pwCard"></div></div>
+  <canvas id="confetti"></canvas>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+  <script src="config.js?v=1"></script>
+  <script src="assets/app.js?v=11"></script>
+</body>
+</html>
