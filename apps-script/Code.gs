@@ -10,7 +10,11 @@
  *
  * Optional: set Script property PALLET_RESET_PASSWORD (a separate password)
  * to enable the "reset_data" action, which wipes movements, repairs and
- * audit_logs (pallet types and departments are kept).
+ * audit_logs (pallet types and departments are kept). The same reset password
+ * (and the same lockout counter) also protects editing / deleting individual
+ * records: movement_update, movement_delete, repair_update, repair_delete.
+ * Every edit/delete is validated by replaying all movements in time order
+ * (see validateLedger_) so stock and department balances never go negative.
  *
  * Transport:
  *   GET  ?action=<read action>&...params        -> {ok:true,data} | {ok:false,error}
@@ -36,6 +40,12 @@ var RESET_ACTION = "reset_data";
 var RESET_PASSWORD_PROPERTY = "PALLET_RESET_PASSWORD";
 var RESET_FAIL_CACHE_KEY = "PALLET_RESET_FAILURES";
 var RESET_TABLES = ["movements", "repairs", "audit_logs"]; // pallet_types/departments are kept
+// Record maintenance actions: protected by PALLET_RESET_PASSWORD only.
+var RECORD_ACT_NAME = {
+  movement_update: "แก้ไขรายการ", movement_delete: "ลบรายการ",
+  repair_update: "แก้ไขใบแจ้งซ่อม", repair_delete: "ลบใบแจ้งซ่อม"
+};
+var RESET_PASSWORD_ACTIONS = [RESET_ACTION, "movement_update", "movement_delete", "repair_update", "repair_delete"];
 
 // Asia/Bangkok has no daylight saving time, so a fixed +07:00 offset gives the
 // same wall-clock values as PHP's date_default_timezone_set('Asia/Bangkok').
@@ -115,7 +125,8 @@ function doGet(e) {
   var action = String(params.action || "");
   try {
     if (!action) return jsonResponse_({ ok: true, data: { service: "Pallet Hub API" } });
-    if (WRITE_ACTIONS.indexOf(action) !== -1 || action === "verifyPassword" || action === RESET_ACTION) {
+    if (WRITE_ACTIONS.indexOf(action) !== -1 || action === "verifyPassword" || action === "verifyResetPassword" ||
+        RESET_PASSWORD_ACTIONS.indexOf(action) !== -1) {
       throw new Error("คำสั่งนี้ต้องส่งแบบ POST");
     }
     resetRequest_("");
@@ -139,7 +150,10 @@ function doPost(e) {
     if (action === "verifyPassword") {
       return jsonResponse_({ ok: true, data: verifyActionPassword(payload.password) });
     }
-    if (action === RESET_ACTION) {
+    if (action === "verifyResetPassword") {
+      return jsonResponse_({ ok: true, data: verifyResetPassword(payload.resetPassword) });
+    }
+    if (RESET_PASSWORD_ACTIONS.indexOf(action) !== -1) {
       // Uses ONLY the reset password (PALLET_ACTION_PASSWORD is not required).
       assertResetPassword_(payload.resetPassword);
     } else {
@@ -178,10 +192,13 @@ function runWrite_(action, input) {
     } catch (error) {
       // Nothing buffered by the failed action is written (acts as a rollback).
       var message = errorMessage_(error);
-      if (ACT_NAME[action]) {
+      var actName = ACT_NAME[action] || RECORD_ACT_NAME[action];
+      if (actName) {
         try {
           resetRequest_(actor);
-          audit_("warn", action, "ปฏิเสธ" + ACT_NAME[action] + ": " + message, "", phpTrim_(safeStr_(input.person)));
+          // Record edits: input.person is the record's new value, not the actor.
+          var who = RECORD_ACT_NAME[action] ? "" : phpTrim_(safeStr_(input.person));
+          audit_("warn", action, "ปฏิเสธ" + actName + ": " + message, "", who);
           flush_();
         } catch (ignored) {}
       }
@@ -196,6 +213,11 @@ function runWrite_(action, input) {
 
 function verifyActionPassword(password) {
   assertActionPassword_(password);
+  return { valid: true };
+}
+
+function verifyResetPassword(password) {
+  assertResetPassword_(password);
   return { valid: true };
 }
 
@@ -263,6 +285,10 @@ function handleWrite_(action, input) {
     case "dept_save": return actionDeptSave_(input);
     case "dept_delete": return actionDeptDelete_(input);
     case RESET_ACTION: return actionResetData_();
+    case "movement_update": return actionMovementUpdate_(input);
+    case "movement_delete": return actionMovementDelete_(input);
+    case "repair_update": return actionRepairUpdate_(input);
+    case "repair_delete": return actionRepairDelete_(input);
   }
   fail_("Unknown action");
 }
@@ -417,10 +443,18 @@ function queryHistory_(p) {
     if (q && !(q(m.doc_no) || q(m.person) || q(m.note))) return false;
     return true;
   });
+  var tickets = null;
   return sortBy_(rows, byMovedDesc_).slice(0, 2000).map(function (m) {
     var t = typeMap[m.type_id];
     var o = plain_(m);
     o.tkey = t.tkey; o.code = t.code; o.color = t.color; o.type_name = t.name;
+    if (m.repair_id != null) { // ticket number of the repair chain (for the delete confirm)
+      if (!tickets) {
+        tickets = {};
+        table_("repairs").rows.forEach(function (r) { tickets[r.id] = r.ticket_no; });
+      }
+      o.ticket_no = tickets[m.repair_id] || null;
+    }
     return o;
   });
 }
@@ -614,6 +648,7 @@ function actionResetData_() {
     delete REQ_.appends[name];
   });
   REQ_.updates = REQ_.updates.filter(function (u) { return RESET_TABLES.indexOf(u.name) === -1; });
+  REQ_.deletes = REQ_.deletes.filter(function (d) { return RESET_TABLES.indexOf(d.name) === -1; });
 
   audit_("setting", "รีเซ็ตข้อมูล",
     "รีเซ็ตข้อมูล: ล้างชีต movements (" + removed.movements + " แถว), repairs (" + removed.repairs +
@@ -623,6 +658,345 @@ function actionResetData_() {
     message: "รีเซ็ตข้อมูลแล้ว — ลบประวัติเคลื่อนไหว " + removed.movements + " แถว, งานซ่อม " +
       removed.repairs + " แถว, บันทึกประวัติ " + removed.audit_logs + " แถว"
   };
+}
+
+/* ===================== record maintenance (edit / delete) =====================
+ *
+ * Protected by PALLET_RESET_PASSWORD (same lockout counter as reset_data).
+ *
+ * Repair chains: a repair ticket and its movements (damage -> [repair_start]
+ * -> repair_done | scrap, linked by repair_id) are treated as ONE unit:
+ *  - deleting any movement of a chain (or the ticket) deletes the whole chain:
+ *    every movement with that repair_id plus the ticket;
+ *  - editing qty on any movement of a chain applies the same qty to every
+ *    movement of the chain and to the ticket (they must always be equal);
+ *  - editing date/time keeps the ticket timestamps in sync (damage ->
+ *    reported_at, repair_start -> started_at, repair_done/scrap ->
+ *    finished_at) and the chain must stay in order;
+ *  - editing the department of a damage-from-issued movement updates the
+ *    ticket's department.
+ * action / type / size / statuses are never editable (delete and re-enter).
+ *
+ * Every proposal is applied to in-memory copies first and checked by
+ * validateLedger_ (chronological replay) + checkChains_; nothing is written
+ * unless both pass.
+ */
+
+var CHAIN_SEQUENCES = {
+  damaged: ["damage"],
+  repairing: ["damage,repair_start"],
+  done: ["damage,repair_start,repair_done"],
+  scrapped: ["damage,scrap", "damage,repair_start,scrap"]
+};
+
+function actionMovementUpdate_(input) {
+  var verb = "แก้ไขไม่ได้";
+  var m = findMovement_(input);
+  ["type_id", "size", "from_status", "to_status", "repair_id"].forEach(function (k) {
+    if (input[k] === undefined) return;
+    if (str_(input[k]) !== str_(m[k])) {
+      fail_("แก้ไขรายการ/ประเภท/ขนาด/สถานะไม่ได้ — หากต้องการเปลี่ยน กรุณาลบรายการนี้แล้วบันทึกใหม่");
+    }
+  });
+
+  var ch = {};
+  if (input.qty !== undefined) {
+    var qty = phpInt_(input.qty);
+    if (qty <= 0) fail_("จำนวนต้องมากกว่า 0");
+    if (qty !== m.qty) ch.qty = qty;
+  }
+  if (input.date !== undefined || input.time !== undefined) {
+    var at = moment_({
+      date: input.date == null ? m.moved_at.slice(0, 10) : input.date,
+      time: input.time == null ? m.moved_at.slice(11, 16) : input.time
+    });
+    if (at !== m.moved_at) ch.moved_at = at;
+  }
+  if (input.department !== undefined) {
+    var dept = phpTrim_(safeStr_(input.department));
+    if (!deptEditable_(m)) {
+      if (dept !== "" && dept !== str_(m.department)) fail_("รายการ" + ACT_NAME[m.action] + "นี้ไม่มีฝ่ายให้แก้ไข");
+    } else {
+      if (dept === "") fail_("กรุณาเลือกฝ่าย");
+      if (mbLen_(dept) > 100) fail_("ชื่อฝ่ายยาวเกิน 100 ตัวอักษร");
+      if (dept !== m.department) ch.department = dept;
+    }
+  }
+  if (input.person !== undefined) {
+    var person = textIn_(input, "person", MAX_PERSON, "ชื่อผู้ทำรายการ");
+    if (person !== m.person) ch.person = person;
+  }
+  if (input.note !== undefined) {
+    var note = textIn_(input, "note", MAX_TEXT, "หมายเหตุ");
+    if (note !== m.note) ch.note = note;
+  }
+  if (!Object.keys(ch).length) return { changed: false, message: "ไม่มีการเปลี่ยนแปลง" };
+
+  var moves = table_("movements").rows;
+  var pMoves = cloneRows_(moves);
+  var pRepairs = cloneRows_(table_("repairs").rows);
+  var target = null;
+  pMoves.forEach(function (c) { if (c.id === m.id) target = c; });
+  Object.keys(ch).forEach(function (k) { target[k] = ch[k]; });
+
+  var chainNote = "";
+  var touched = [];
+  if (m.repair_id != null) {
+    touched.push(m.repair_id);
+    var chain = pMoves.filter(function (c) { return c.repair_id === m.repair_id; });
+    if (ch.qty !== undefined) chain.forEach(function (c) { c.qty = ch.qty; });
+    var ticket = null;
+    pRepairs.forEach(function (r) { if (r.id === m.repair_id) ticket = r; });
+    if (ticket) {
+      syncTicket_(ticket, chain);
+      if (ch.qty !== undefined) {
+        chainNote = " · ปรับจำนวนทั้งชุดงานซ่อม " + ticket.ticket_no + " (" + chain.length + " รายการ + ใบแจ้งซ่อม)";
+      }
+    }
+  }
+
+  validateLedger_(moves, pMoves, verb);
+  checkChains_(pMoves, pRepairs, touched, verb);
+
+  // before -> after text (built before the live row m is updated)
+  var labels = { qty: "จำนวน", moved_at: "วันที่/เวลา", department: "ฝ่าย", person: "ผู้ทำรายการ", note: "หมายเหตุ" };
+  var parts = Object.keys(labels).filter(function (k) { return ch[k] !== undefined; }).map(function (k) {
+    if (k === "qty") return labels[k] + " " + m.qty + " → " + ch.qty;
+    if (k === "moved_at") return labels[k] + " " + dtTh_(m.moved_at) + " → " + dtTh_(ch.moved_at);
+    return labels[k] + ' "' + str_(m[k]) + '" → "' + ch[k] + '"';
+  });
+  var t = typeMap_()[m.type_id] || {};
+
+  applyCopies_("movements", pMoves);
+  applyCopies_("repairs", pRepairs);
+
+  audit_("pallet", "แก้ไขรายการ",
+    "แก้ไขรายการ " + m.doc_no + " (" + ACT_NAME[m.action] + " " + str_(t.code) + " ขนาด " + m.size + "): " +
+    parts.join("; ") + chainNote, m.doc_no, "");
+  return { changed: true, message: "แก้ไขรายการ " + m.doc_no + " แล้ว" };
+}
+
+function actionMovementDelete_(input) {
+  var m = findMovement_(input);
+  if (m.repair_id != null) return deleteChain_(m.repair_id);
+
+  var moves = table_("movements").rows;
+  var proposed = moves.filter(function (r) { return r.id !== m.id; });
+  validateLedger_(moves, proposed, "ลบไม่ได้");
+  var desc = describeMove_(m);
+  delete_("movements", m);
+  audit_("pallet", "ลบรายการ", "ลบรายการ " + m.doc_no + ": " + desc, m.doc_no, "");
+  return { removed: { movements: 1, repairs: 0 }, message: "ลบรายการ " + m.doc_no + " แล้ว" };
+}
+
+function actionRepairDelete_(input) {
+  return deleteChain_(findTicket_(input).id);
+}
+
+function actionRepairUpdate_(input) {
+  var rp = findTicket_(input);
+  ["qty", "stage", "type_id", "size", "source", "department"].forEach(function (k) {
+    if (input[k] === undefined) return;
+    if (str_(input[k]) !== str_(rp[k])) {
+      fail_("แก้ไขจำนวน/สถานะ/ประเภท/ฝ่ายของใบแจ้งซ่อมไม่ได้ — แก้ได้ที่รายการแจ้งชำรุดในหน้าประวัติเคลื่อนไหว หรือลบแล้วบันทึกใหม่");
+    }
+  });
+  var fields = [
+    ["cause", MAX_TEXT, "สาเหตุการชำรุด"], ["reported_by", MAX_PERSON, "ผู้แจ้ง"],
+    ["repairer", MAX_PERSON, "ช่างผู้ซ่อม"], ["note", MAX_REPAIR_NOTE, "หมายเหตุ"]
+  ];
+  var ch = {};
+  var parts = [];
+  fields.forEach(function (f) {
+    if (input[f[0]] === undefined) return;
+    var v = textIn_(input, f[0], f[1], f[2]);
+    if (v !== str_(rp[f[0]])) {
+      ch[f[0]] = v;
+      parts.push(f[2] + ' "' + str_(rp[f[0]]) + '" → "' + v + '"');
+    }
+  });
+  if (!parts.length) return { changed: false, message: "ไม่มีการเปลี่ยนแปลง" };
+  update_("repairs", rp, ch);
+  audit_("repair", "แก้ไขใบแจ้งซ่อม", "แก้ไขใบแจ้งซ่อม " + rp.ticket_no + ": " + parts.join("; "), rp.ticket_no, "");
+  return { changed: true, message: "แก้ไขใบแจ้งซ่อม " + rp.ticket_no + " แล้ว" };
+}
+
+// Deletes a repair ticket and every movement linked to it as one unit.
+function deleteChain_(rid) {
+  var moves = table_("movements").rows;
+  var chain = sortBy_(moves.filter(function (r) { return r.repair_id === rid; }), byMovedAsc_);
+  var ticket = null;
+  table_("repairs").rows.forEach(function (r) { if (r.id === rid) ticket = r; });
+  var proposed = moves.filter(function (r) { return r.repair_id !== rid; });
+  validateLedger_(moves, proposed, "ลบไม่ได้");
+
+  var tno = ticket ? ticket.ticket_no : "#" + rid;
+  var list = chain.map(function (c) {
+    return c.doc_no + " " + ACT_NAME[c.action] + " " + c.qty + " ตัว (" + dtTh_(c.moved_at) + ")";
+  });
+  var t = typeMap_()[(ticket || chain[0] || {}).type_id] || {};
+  chain.forEach(function (c) { delete_("movements", c); });
+  if (ticket) delete_("repairs", ticket);
+  audit_("pallet", "ลบรายการ",
+    "ลบรายการทั้งชุดงานซ่อม " + tno + " (" + str_(t.code) + " ขนาด " + str_((ticket || chain[0] || {}).size) + "): " +
+    (ticket ? "ใบแจ้งซ่อม + " : "") + chain.length + " รายการ — " + list.join(", "), tno, "");
+  return {
+    removed: { movements: chain.length, repairs: ticket ? 1 : 0 },
+    message: "ลบงานซ่อม " + tno + " ทั้งชุดแล้ว (ใบแจ้งซ่อม + " + chain.length + " รายการเคลื่อนไหว)"
+  };
+}
+
+function findMovement_(input) {
+  var id = phpInt_(input.id);
+  var rows = table_("movements").rows;
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].id !== id) continue;
+    // doc_no guards against acting on a stale page (ids can be reused after a delete).
+    if (!phpEmpty_(input.doc_no) && safeStr_(input.doc_no) !== rows[i].doc_no) break;
+    return rows[i];
+  }
+  fail_("ไม่พบรายการเคลื่อนไหวนี้ (อาจถูกแก้ไข/ลบไปแล้ว) กรุณาโหลดหน้าใหม่");
+}
+
+function findTicket_(input) {
+  var id = phpInt_(input.id);
+  var rows = table_("repairs").rows;
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].id !== id) continue;
+    if (!phpEmpty_(input.ticket_no) && safeStr_(input.ticket_no) !== rows[i].ticket_no) break;
+    return rows[i];
+  }
+  fail_("ไม่พบใบแจ้งซ่อมนี้ (อาจถูกลบไปแล้ว) กรุณาโหลดหน้าใหม่");
+}
+
+function deptEditable_(m) {
+  return m.action === "issue" || m.action === "return" || (m.action === "damage" && m.from_status === "issued");
+}
+
+// Copies of rows (enumerable fields) that remember their live row in _orig.
+function cloneRows_(rows) {
+  return rows.map(function (r) {
+    var c = plain_(r);
+    Object.defineProperty(c, "_orig", { value: r, enumerable: false });
+    return c;
+  });
+}
+
+// Writes the fields that differ between each copy and its live row.
+function applyCopies_(name, copies) {
+  copies.forEach(function (c) {
+    var ch = {};
+    Object.keys(c).forEach(function (k) { if (c[k] !== c._orig[k]) ch[k] = c[k]; });
+    if (Object.keys(ch).length) update_(name, c._orig, ch);
+  });
+}
+
+// Ticket fields derived from its movements.
+function syncTicket_(ticket, chain) {
+  chain.forEach(function (c) {
+    if (c.action === "damage") {
+      ticket.qty = c.qty;
+      ticket.reported_at = c.moved_at;
+      if (c.from_status === "issued") ticket.department = c.department;
+    } else if (c.action === "repair_start") {
+      ticket.started_at = c.moved_at;
+    } else if (c.action === "repair_done" || c.action === "scrap") {
+      ticket.finished_at = c.moved_at;
+    }
+  });
+}
+
+/*
+ * Replays the movements in chronological order (moved_at, then id) and
+ * rejects the proposal if any stock bucket (type x size x status) or any
+ * department's outstanding qty (type x size) drops below zero at any point.
+ * A bucket that ALREADY dipped below zero before the change (possible with
+ * back-dated legacy entries) may not get any lower than it already was, so
+ * old inconsistencies never block unrelated edits.
+ */
+function validateLedger_(before, after, verb) {
+  var base = replay_(before, null);
+  var breach = replay_(after, base.min);
+  if (!breach) return;
+  var t = typeMap_()[breach.type_id] || {};
+  var label = str_(t.code) + " " + breach.size;
+  var when = " ณ วันที่ " + dtTh_(breach.at.moved_at) + " (" + breach.at.doc_no + ")";
+  if (breach.kind === "stock") {
+    fail_(verb + ": ยอด" + STATUS_NAME[breach.status] + " " + label + " จะติดลบ (" + breach.value + ")" + when);
+  }
+  fail_(verb + ": ยอดพาเลท " + label + " ที่ " + breach.department + " ถืออยู่ จะติดลบ (" + breach.value + ")" + when);
+}
+
+// Without limits: returns {min} (lowest running balance per key). With
+// limits: returns the first breach {kind, ..., value, at} or null.
+function replay_(moves, limits) {
+  var bal = {};
+  var min = {};
+  var sorted = sortBy_(moves.slice(), byMovedAsc_);
+  for (var i = 0; i < sorted.length; i++) {
+    var m = sorted[i];
+    var deltas = [];
+    if (m.to_status != null) deltas.push([{ kind: "stock", type_id: m.type_id, size: m.size, status: m.to_status }, m.qty]);
+    if (m.from_status != null) deltas.push([{ kind: "stock", type_id: m.type_id, size: m.size, status: m.from_status }, -m.qty]);
+    if (m.department != null && m.department !== "") {
+      var dq = m.to_status === "issued" ? m.qty : (m.from_status === "issued" ? -m.qty : 0);
+      if (dq) deltas.push([{ kind: "dept", type_id: m.type_id, size: m.size, department: m.department }, dq]);
+    }
+    for (var j = 0; j < deltas.length; j++) {
+      var info = deltas[j][0];
+      var key = info.kind === "stock"
+        ? "s\u0000" + info.type_id + "\u0000" + info.size + "\u0000" + info.status
+        : "d\u0000" + info.department + "\u0000" + info.type_id + "\u0000" + info.size;
+      var v = (bal[key] || 0) + deltas[j][1];
+      bal[key] = v;
+      if (v < (min[key] || 0)) min[key] = v;
+      if (limits && deltas[j][1] < 0 && v < Math.min(0, limits[key] || 0)) {
+        info.value = v;
+        info.at = m;
+        return info;
+      }
+    }
+  }
+  return limits ? null : { min: min };
+}
+
+// Each touched ticket must still match its movements: action sequence (in
+// replay order) fits the stage, and qty / type / size are the same everywhere.
+function checkChains_(moves, repairs, ids, verb) {
+  ids.forEach(function (rid) {
+    var ticket = null;
+    repairs.forEach(function (r) { if (r.id === rid) ticket = r; });
+    var chain = sortBy_(moves.filter(function (c) { return c.repair_id === rid; }), byMovedAsc_);
+    if (!ticket) {
+      if (chain.length) fail_(verb + ": ยังมีรายการที่อ้างถึงใบแจ้งซ่อมที่ไม่มีอยู่");
+      return;
+    }
+    var seq = chain.map(function (c) { return c.action; }).join(",");
+    if ((CHAIN_SEQUENCES[ticket.stage] || []).indexOf(seq) === -1) {
+      fail_(verb + ": ลำดับเวลาของงานซ่อม " + ticket.ticket_no +
+        " ไม่ถูกต้อง — วันที่ต้องเรียง แจ้งชำรุด → ส่งซ่อม → ซ่อมเสร็จ/ตัดจำหน่าย");
+    }
+    chain.forEach(function (c) {
+      if (c.qty !== ticket.qty || c.type_id !== ticket.type_id || c.size !== ticket.size) {
+        fail_(verb + ": จำนวน/ประเภทของงานซ่อม " + ticket.ticket_no + " ไม่ตรงกับรายการเคลื่อนไหว");
+      }
+    });
+  });
+}
+
+function describeMove_(m) {
+  var t = typeMap_()[m.type_id] || {};
+  return ACT_NAME[m.action] + " " + str_(t.code) + " (" + str_(t.name) + ") ขนาด " + m.size + " ม. จำนวน " + m.qty + " ตัว" +
+    " · วันที่ " + dtTh_(m.moved_at) +
+    (!phpEmpty_(m.department) ? " · ฝ่าย: " + m.department : "") +
+    (!phpEmpty_(m.person) ? " · ผู้ทำรายการ: " + m.person : "") +
+    (!phpEmpty_(m.note) ? " · " + m.note : "");
+}
+
+// "YYYY-MM-DD HH:MM:SS" -> "DD/MM/YYYY HH:MM"
+function dtTh_(s) {
+  s = str_(s);
+  return s.slice(8, 10) + "/" + s.slice(5, 7) + "/" + s.slice(0, 4) + " " + s.slice(11, 16);
 }
 
 /* ===================== business helpers ===================== */
@@ -711,12 +1085,22 @@ function moment_(input) {
   return formatUtcParts_(dt).datetime.slice(0, 16) + ":00";
 }
 
+// Next running number for today's tag = highest number used so far + 1. Audit
+// log refs are scanned too, so a number freed by deleting a record is never
+// handed out again (its audit rows still refer to it). reset_data clears both.
 function nextNo_(prefix, table, col) {
   var tag = prefix + "-" + nowParts_().ymd + "-";
-  var count = table_(table).rows.filter(function (r) {
-    return String(r[col] || "").toUpperCase().indexOf(tag) === 0;
-  }).length;
-  return tag + ("0000" + (count + 1)).slice(-Math.max(4, String(count + 1).length));
+  var max = 0;
+  var scan = function (v) {
+    var s = String(v || "").toUpperCase();
+    if (s.indexOf(tag) !== 0) return;
+    var n = parseInt(s.slice(tag.length), 10);
+    if (n > max) max = n;
+  };
+  table_(table).rows.forEach(function (r) { scan(r[col]); });
+  table_("audit_logs").rows.forEach(function (l) { scan(l.ref); });
+  var next = max + 1;
+  return tag + ("0000" + next).slice(-Math.max(4, String(next).length));
 }
 
 function move_(action, type, size, qty, from, to, extra) {
@@ -775,7 +1159,7 @@ function textIn_(input, key, max, label) {
 var REQ_ = null; // per-request state: spreadsheet, loaded tables, pending writes
 
 function resetRequest_(actor) {
-  REQ_ = { ss: null, tables: {}, appends: {}, updates: [], actor: actor || "" };
+  REQ_ = { ss: null, tables: {}, appends: {}, updates: [], deletes: [], actor: actor || "" };
 }
 
 function db_() {
@@ -836,8 +1220,52 @@ function update_(name, row, fields) {
   } // rows inserted in this request are written with their latest values on flush
 }
 
-// Writes buffered rows: one setNumberFormats + one setValues per table.
+// Removes a row from the in-memory table and buffers the sheet row deletion.
+function delete_(name, row) {
+  var t = table_(name);
+  var i = t.rows.indexOf(row);
+  if (i !== -1) t.rows.splice(i, 1);
+  REQ_.updates = REQ_.updates.filter(function (u) { return u.row !== row; });
+  if (row._row > 0) {
+    REQ_.deletes.push({ name: name, row: row });
+  } else if (REQ_.appends[name]) {
+    REQ_.appends[name] = REQ_.appends[name].filter(function (r) { return r !== row; });
+  }
+}
+
+// Writes buffered changes in a safe order: updates (row numbers are still the
+// ones read at the start of the request), then deletions (highest row first,
+// each run of consecutive rows in one deleteRows call), then appends (one
+// setNumberFormats + one setValues per table). Tables that lost rows are
+// dropped from the per-request cache because their row numbers have shifted.
 function flush_() {
+  REQ_.updates.forEach(function (u) {
+    var t = REQ_.tables[u.name];
+    var range = t.sheet.getRange(u.row._row, 1, 1, t.header.length);
+    var current = range.getValues()[0];
+    range.setValues([rowValues_(u.name, t, u.row, t.header.length, current)]);
+  });
+  REQ_.updates = [];
+
+  var byTable = {};
+  REQ_.deletes.forEach(function (d) { (byTable[d.name] = byTable[d.name] || []).push(d.row._row); });
+  Object.keys(byTable).forEach(function (name) {
+    var sheet = REQ_.tables[name].sheet;
+    var rows = byTable[name]
+      .filter(function (r, i, a) { return r > 1 && a.indexOf(r) === i; })
+      .sort(function (a, b) { return b - a; });
+    // Sheets refuses to delete every non-frozen row: keep one spare row.
+    if (sheet.getMaxRows() - rows.length < 2) sheet.insertRowsAfter(sheet.getMaxRows(), 1);
+    var i = 0;
+    while (i < rows.length) {
+      var j = i;
+      while (j + 1 < rows.length && rows[j + 1] === rows[j] - 1) j++;
+      sheet.deleteRows(rows[j], j - i + 1); // rows[j] = lowest row number of the run
+      i = j + 1;
+    }
+  });
+  REQ_.deletes = [];
+
   Object.keys(REQ_.appends).forEach(function (name) {
     var list = REQ_.appends[name];
     if (!list.length) return;
@@ -857,14 +1285,8 @@ function flush_() {
     range.setNumberFormats(formats);
     range.setValues(values);
   });
-  REQ_.updates.forEach(function (u) {
-    var t = REQ_.tables[u.name];
-    var range = t.sheet.getRange(u.row._row, 1, 1, t.header.length);
-    var current = range.getValues()[0];
-    range.setValues([rowValues_(u.name, t, u.row, t.header.length, current)]);
-  });
   REQ_.appends = {};
-  REQ_.updates = [];
+  Object.keys(byTable).forEach(function (name) { delete REQ_.tables[name]; });
 }
 
 function rowValues_(name, t, row, width, base) {
@@ -960,7 +1382,7 @@ function setupSystem() {
     sheet.getRange(1, 1, maxRows, headers.length).setNumberFormats(formats);
   });
 
-  REQ_ = { ss: ss, tables: {}, appends: {}, updates: [], actor: "" };
+  REQ_ = { ss: ss, tables: {}, appends: {}, updates: [], deletes: [], actor: "" };
   if (!table_("pallet_types").rows.length) {
     SEED_TYPES.forEach(function (t) {
       insert_("pallet_types", { tkey: t[0], code: t[1], name: t[2], short: t[3], description: t[4], color: t[5], sizes: t[6], sort: t[7] });
@@ -1015,6 +1437,11 @@ function sortBy_(arr, cmp) { // stable sort
   return arr.map(function (v, i) { return [v, i]; })
     .sort(function (a, b) { return cmp(a[0], b[0]) || a[1] - b[1]; })
     .map(function (p) { return p[0]; });
+}
+
+function byMovedAsc_(a, b) {
+  if (a.moved_at !== b.moved_at) return a.moved_at < b.moved_at ? -1 : 1;
+  return a.id - b.id;
 }
 
 function byMovedDesc_(a, b) {

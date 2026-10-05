@@ -81,7 +81,17 @@ function createGas() {
     insertRowsAfter(after, n) { this.maxRows += n; return this; }
     getRange(r, c, nr = 1, nc = 1) { return new Range(this, r, c, nr, nc); }
     getDataRange() { return new Range(this, 1, 1, Math.max(1, this.getLastRow()), Math.max(1, this.getLastColumn())); }
-    setFrozenRows() { return this; }
+    setFrozenRows(n) { this.frozen = n; return this; }
+    getFrozenRows() { return this.frozen || 0; }
+    deleteRows(pos, n) {
+      if (pos < 1 || n < 1 || pos + n - 1 > this.maxRows) throw new Error("deleteRows out of bounds");
+      if (this.maxRows - n <= (this.frozen || 0)) throw new Error("Sorry, it is not possible to delete all non-frozen rows.");
+      state.deleteCalls = (state.deleteCalls || []).concat([[this.name, pos, n]]);
+      this.data.splice(pos - 1, n);
+      this.maxRows -= n;
+      return this;
+    }
+    deleteRow(pos) { return this.deleteRows(pos, 1); }
   }
 
   class Spreadsheet {
@@ -773,6 +783,324 @@ test("reset_data on already-empty sheets reports zero rows removed", () => {
   assert.strictEqual(okData(get("logs")).items.length, 1);
 });
 
+/* ---------- edit / delete records (reset password) ---------- */
+const rec = (action, body = {}, pw = RPW) => postRaw(Object.assign({}, body, { action, resetPassword: pw, actor: "Editor" }));
+const hist = () => okData(get("history")).items;
+const byDoc = doc => hist().find(m => m.doc_no === doc);
+const rowsOf = n => { const d = sheet(n).data; const h = d[0]; return d.slice(1).filter(r => r.some(v => v !== "" && v != null)).map(r => Object.fromEntries(h.map((k, i) => [k, r[i]]))); };
+const ticketOf = id => rowsOf("repairs").find(r => r.id === id);
+const sheetDump = () => JSON.stringify(["movements", "repairs", "audit_logs"].map(n => sheet(n).data));
+const st = () => okData(get("bootstrap"));
+const doc = (p, n) => `${p}-${YMD}-${String(n).padStart(4, "0")}`;
+const at = (date, time) => ({ date, time });
+const D = {};
+
+test("edit/delete setup: RM + PK movements and repair chains", () => {
+  okData(reset(RPW));
+  state.cache = {};
+  D.r1 = okData(post("receive", Object.assign({ type_id: 1, size: "1.2x1.2", qty: 10 }, at("2026-01-10", "08:00"))));
+  D.i1 = okData(post("issue", Object.assign({ type_id: 1, size: "1.2x1.2", qty: 6, department: "ฝ่ายผลิต" }, at("2026-01-10", "09:00"))));
+  D.r2 = okData(post("receive", Object.assign({ type_id: 1, size: "1.2x1.2", qty: 5 }, at("2026-01-11", "08:00"))));
+  D.t1 = okData(post("return", Object.assign({ type_id: 1, size: "1.2x1.2", qty: 2, department: "ฝ่ายผลิต" }, at("2026-01-12", "08:00"))));
+  // PK 1.1x1.1
+  D.p1 = okData(post("receive", Object.assign({ type_id: 2, size: "1.1x1.1", qty: 20 }, at("2026-02-01", "08:00"))));
+  D.p2 = okData(post("issue", Object.assign({ type_id: 2, size: "1.1x1.1", qty: 10, department: "ฝ่ายบรรจุ" }, at("2026-02-01", "09:00"))));
+  D.xDm = okData(post("return", Object.assign({ type_id: 2, size: "1.1x1.1", qty: 4, department: "ฝ่ายบรรจุ", condition: "damaged", cause: "หัก" }, at("2026-02-02", "08:00"))));
+  D.x = rowsOf("repairs").pop();
+  D.xRp = okData(post("repair_start", Object.assign({ id: D.x.id }, at("2026-02-02", "09:00"))));
+  D.xRd = okData(post("repair_done", Object.assign({ id: D.x.id }, at("2026-02-02", "10:00"))));
+  D.p3 = okData(post("issue", Object.assign({ type_id: 2, size: "1.1x1.1", qty: 14, department: "ฝ่ายผลิต" }, at("2026-02-03", "08:00"))));
+  D.p4 = okData(post("receive", Object.assign({ type_id: 2, size: "1.1x1.1", qty: 10 }, at("2026-02-04", "08:00"))));
+  D.zDm = okData(post("damage", Object.assign({ type_id: 2, size: "1.1x1.1", qty: 3, cause: "z" }, at("2026-02-04", "08:30"))));
+  D.z = rowsOf("repairs").pop();
+  D.yDm = okData(post("damage", Object.assign({ type_id: 2, size: "1.1x1.1", qty: 3, cause: "y" }, at("2026-02-04", "09:00"))));
+  D.y = rowsOf("repairs").pop();
+  D.yRp = okData(post("repair_start", Object.assign({ id: D.y.id, person: "ช่าง" }, at("2026-02-04", "10:00"))));
+  const b = st();
+  assert.strictEqual(stockOf(b.stock, 1, "1.2x1.2", "available"), 11);
+  assert.strictEqual(stockOf(b.stock, 1, "1.2x1.2", "issued"), 4);
+  assert.strictEqual(stockOf(b.stock, 2, "1.1x1.1", "available"), 4);
+  assert.strictEqual(stockOf(b.stock, 2, "1.1x1.1", "damaged"), 3);
+  assert.strictEqual(stockOf(b.stock, 2, "1.1x1.1", "repairing"), 3);
+  assert.strictEqual(byDoc(D.xRd.doc_no).ticket_no, D.x.ticket_no); // history exposes the chain's ticket
+  assert.strictEqual(byDoc(D.r1.doc_no).ticket_no, undefined);
+});
+
+test("edit/delete refused while PALLET_RESET_PASSWORD is unset; GET refused", () => {
+  const saved = state.props.PALLET_RESET_PASSWORD;
+  delete state.props.PALLET_RESET_PASSWORD;
+  const before = sheetDump();
+  for (const a of ["movement_update", "movement_delete", "repair_update", "repair_delete"]) {
+    const r = err(rec(a, { id: D.r1.id, qty: 1 }), /PALLET_RESET_PASSWORD/);
+    assert.strictEqual(r.passwordError, true);
+  }
+  err(postRaw({ action: "verifyResetPassword", resetPassword: "x" }), /ยังไม่ได้ตั้งรหัสรีเซ็ตข้อมูล/);
+  for (const a of ["movement_update", "movement_delete", "repair_update", "repair_delete", "verifyResetPassword"]) err(get(a), /POST/);
+  assert.strictEqual(sheetDump(), before);
+  state.props.PALLET_RESET_PASSWORD = saved;
+});
+
+test("edit/delete with wrong password (or the action password) refused, slept, NOT logged", () => {
+  state.cache = {};
+  const before = sheetDump();
+  const sleeps = state.sleeps;
+  const r = err(rec("movement_delete", { id: D.r2.id }, "wrong"), /รหัสไม่ถูกต้อง/);
+  assert.strictEqual(r.passwordError, true);
+  assert.strictEqual(state.sleeps - sleeps, 1000);
+  err(rec("movement_update", { id: D.r2.id, qty: 1 }, PW), /รหัสไม่ถูกต้อง/); // action password is not enough
+  err(postRaw({ action: "repair_update", password: RPW, id: D.x.id, cause: "x" }), /รหัสไม่ถูกต้อง/); // must be resetPassword
+  err(postRaw({ action: "verifyResetPassword", resetPassword: "nope" }), /รหัสไม่ถูกต้อง/);
+  assert.strictEqual(state.cache.PALLET_RESET_FAILURES, "4");
+  assert.ok(!("PALLET_PASSWORD_FAILURES" in state.cache));
+  assert.strictEqual(sheetDump(), before);
+  assert.deepStrictEqual(okData(postRaw({ action: "verifyResetPassword", resetPassword: RPW })), { valid: true });
+  state.cache = {};
+});
+
+test("edit/delete lockout is shared with reset_data", () => {
+  state.cache = {};
+  for (let i = 0; i < 5; i++) err(reset("guess" + i), /รหัสไม่ถูกต้อง/);
+  for (let i = 0; i < 5; i++) err(rec("movement_delete", { id: D.r2.id }, "guess" + i), /รหัสไม่ถูกต้อง/);
+  const before = sheetDump();
+  err(rec("movement_delete", { id: D.r2.id }), /หลายครั้งเกินไป/);
+  err(rec("repair_update", { id: D.x.id, cause: "x" }), /หลายครั้งเกินไป/);
+  err(postRaw({ action: "verifyResetPassword", resetPassword: RPW }), /หลายครั้งเกินไป/);
+  err(reset(RPW), /หลายครั้งเกินไป/);
+  assert.strictEqual(sheetDump(), before);
+  okData(postRaw({ action: "verifyPassword", password: PW })); // normal password counter unaffected
+  state.cache = {}; // 15 minutes later
+});
+
+test("delete that would make stock negative is rejected with Thai reason, nothing changed, warn logged", () => {
+  const before = sheetDump();
+  const logs = dataRows("audit_logs");
+  const r = err(rec("movement_delete", { id: D.r1.id, doc_no: D.r1.doc_no }));
+  assert.strictEqual(r.error, `ลบไม่ได้: ยอดพร้อมใช้ RM 1.2x1.2 จะติดลบ (-6) ณ วันที่ 10/01/2026 09:00 (${D.i1.doc_no})`);
+  assert.ok(!r.passwordError);
+  const after = JSON.parse(sheetDump()), was = JSON.parse(before);
+  assert.deepStrictEqual(after.slice(0, 2), was.slice(0, 2)); // movements + repairs untouched
+  assert.strictEqual(dataRows("audit_logs"), logs + 1); // + one warn row
+  const log = lastLog();
+  assert.strictEqual(log.category, "warn");
+  assert.strictEqual(log.action, "movement_delete");
+  assert.strictEqual(log.detail, "ปฏิเสธลบรายการ: " + r.error);
+  assert.strictEqual(log.actor, "Editor");
+  // deleting the issue would make the "issued" bucket negative when the return happens
+  err(rec("movement_delete", { id: D.i1.id }), /^ลบไม่ได้: ยอดเบิกไปใช้งาน RM 1\.2x1\.2 จะติดลบ \(-2\) ณ วันที่ 12\/01\/2026 08:00/);
+});
+
+test("delete simple movement: row removed, stock recomputed, audit row, lock used", () => {
+  const n = dataRows("movements");
+  const locks = state.locks;
+  const calls = (state.deleteCalls || []).length;
+  const row = sheet("movements").data.findIndex(r => r[1] === D.r2.doc_no) + 1;
+  const d = okData(rec("movement_delete", { id: D.r2.id, doc_no: D.r2.doc_no }));
+  assert.deepStrictEqual(d.removed, { movements: 1, repairs: 0 });
+  assert.strictEqual(d.message, "ลบรายการ " + D.r2.doc_no + " แล้ว");
+  assert.strictEqual(state.locks - locks, 1);
+  assert.strictEqual(state.locks, state.unlocks);
+  assert.deepStrictEqual(state.deleteCalls.slice(calls), [["movements", row, 1]]);
+  assert.strictEqual(dataRows("movements"), n - 1);
+  assert.ok(!byDoc(D.r2.doc_no));
+  const b = st();
+  assert.strictEqual(stockOf(b.stock, 1, "1.2x1.2", "available"), 6);
+  assert.strictEqual(stockOf(b.stock, 1, "1.2x1.2", "issued"), 4);
+  const log = lastLog();
+  assert.strictEqual(log.category, "pallet");
+  assert.strictEqual(log.action, "ลบรายการ");
+  assert.strictEqual(log.ref, D.r2.doc_no);
+  assert.strictEqual(log.actor, "Editor");
+  assert.ok(log.detail.startsWith(`ลบรายการ ${D.r2.doc_no}: รับเข้า RM (พาเลทสำหรับใส่ RM) ขนาด 1.2x1.2 ม. จำนวน 5 ตัว · วันที่ 11/01/2026 08:00`), log.detail);
+  // stale id / doc_no
+  err(rec("movement_delete", { id: D.r2.id, doc_no: D.r2.doc_no }), /ไม่พบรายการเคลื่อนไหว/);
+  err(rec("movement_delete", { id: D.r1.id, doc_no: "RC-000000-0009" }), /ไม่พบรายการเคลื่อนไหว/);
+});
+
+test("after delete: new entries get fresh ids and never reuse a deleted doc number", () => {
+  const maxId = Math.max(...rowsOf("movements").map(r => r.id));
+  const d = okData(post("receive", Object.assign({ type_id: 4, size: "1.2x1.2", qty: 1 }, AT)));
+  assert.strictEqual(d.doc_no, doc("RC", 5)); // RC-0002 was deleted: not handed out again
+  assert.strictEqual(d.id, maxId + 1);
+  const docs = hist().map(m => m.doc_no);
+  assert.strictEqual(new Set(docs).size, docs.length);
+  okData(rec("movement_delete", { id: d.id, doc_no: d.doc_no })); // highest id + newest number deleted
+  const d2 = okData(post("receive", Object.assign({ type_id: 4, size: "1.2x1.2", qty: 1 }, AT)));
+  assert.strictEqual(d2.doc_no, doc("RC", 6));
+  okData(rec("movement_delete", { id: d2.id, doc_no: d2.doc_no }));
+});
+
+test("edit qty: valid change updates stock + audit before→after; negative replay rejected", () => {
+  const d = okData(rec("movement_update", { id: D.i1.id, doc_no: D.i1.doc_no, qty: 5 }));
+  assert.strictEqual(d.changed, true);
+  assert.strictEqual(d.message, "แก้ไขรายการ " + D.i1.doc_no + " แล้ว");
+  assert.strictEqual(byDoc(D.i1.doc_no).qty, 5);
+  let b = st();
+  assert.strictEqual(stockOf(b.stock, 1, "1.2x1.2", "available"), 7);
+  assert.strictEqual(stockOf(b.stock, 1, "1.2x1.2", "issued"), 3);
+  assert.deepStrictEqual(b.dept.find(r => r.department === "ฝ่ายผลิต" && r.type_id === 1), { department: "ฝ่ายผลิต", type_id: 1, size: "1.2x1.2", qty: 3 });
+  const log = lastLog();
+  assert.strictEqual(log.category, "pallet");
+  assert.strictEqual(log.action, "แก้ไขรายการ");
+  assert.strictEqual(log.ref, D.i1.doc_no);
+  assert.strictEqual(log.detail, `แก้ไขรายการ ${D.i1.doc_no} (เบิกจ่าย RM ขนาด 1.2x1.2): จำนวน 6 → 5`);
+  const before = sheetDump();
+  err(rec("movement_update", { id: D.i1.id, qty: 20 }), /^แก้ไขไม่ได้: ยอดพร้อมใช้ RM 1\.2x1\.2 จะติดลบ \(-10\) ณ วันที่ 10\/01\/2026 09:00/);
+  err(rec("movement_update", { id: D.i1.id, qty: 1 }), /^แก้ไขไม่ได้: ยอดเบิกไปใช้งาน RM 1\.2x1\.2 จะติดลบ \(-1\) ณ วันที่ 12\/01\/2026 08:00/);
+  err(rec("movement_update", { id: D.i1.id, qty: 0 }), /^จำนวนต้องมากกว่า 0$/);
+  const a = JSON.parse(sheetDump()), w = JSON.parse(before);
+  assert.deepStrictEqual(a.slice(0, 2), w.slice(0, 2));
+  assert.strictEqual(lastLog().detail, "ปฏิเสธแก้ไขรายการ: จำนวนต้องมากกว่า 0");
+});
+
+test("edit date: reorder causing negative is rejected; valid date change saved", () => {
+  const before = JSON.parse(sheetDump()).slice(0, 2);
+  err(rec("movement_update", { id: D.i1.id, date: "2026-01-09", time: "08:00" }),
+    /^แก้ไขไม่ได้: ยอดพร้อมใช้ RM 1\.2x1\.2 จะติดลบ \(-5\) ณ วันที่ 09\/01\/2026 08:00/);
+  err(rec("movement_update", { id: D.t1.id, date: "2026-01-10", time: "08:30" }), // return before the issue
+    /^แก้ไขไม่ได้: ยอดเบิกไปใช้งาน RM 1\.2x1\.2 จะติดลบ \(-2\)/);
+  err(rec("movement_update", { id: D.t1.id, date: "2026/01/10", time: "08:30" }), /^วันที่\/เวลาไม่ถูกต้อง$/);
+  assert.deepStrictEqual(JSON.parse(sheetDump()).slice(0, 2), before);
+  okData(rec("movement_update", { id: D.t1.id, date: "2026-01-13", time: "10:30" }));
+  assert.strictEqual(byDoc(D.t1.doc_no).moved_at, "2026-01-13 10:30:00");
+  assert.strictEqual(lastLog().detail, `แก้ไขรายการ ${D.t1.doc_no} (รับคืน RM ขนาด 1.2x1.2): วันที่/เวลา 12/01/2026 08:00 → 13/01/2026 10:30`);
+});
+
+test("edit department / person / note; department checks; immutable fields; no-op", () => {
+  err(rec("movement_update", { id: D.t1.id, department: "ฝ่ายบรรจุ" }),
+    /^แก้ไขไม่ได้: ยอดพาเลท RM 1\.2x1\.2 ที่ ฝ่ายบรรจุ ถืออยู่ จะติดลบ \(-2\) ณ วันที่ 13\/01\/2026 10:30/);
+  err(rec("movement_update", { id: D.t1.id, department: " " }), /^กรุณาเลือกฝ่าย$/);
+  err(rec("movement_update", { id: D.r1.id, department: "ฝ่ายผลิต" }), /ไม่มีฝ่ายให้แก้ไข/);
+  okData(rec("movement_update", { id: D.r1.id, department: "" })); // receive has no department: blank is fine
+  okData(rec("movement_update", { id: D.p3.id, department: "ฝ่ายคลังสินค้า" }));
+  const b = st();
+  assert.ok(b.dept.some(r => r.department === "ฝ่ายคลังสินค้า" && r.type_id === 2 && r.qty === 14));
+  assert.ok(!b.dept.some(r => r.department === "ฝ่ายผลิต" && r.type_id === 2));
+  okData(rec("movement_update", { id: D.r1.id, person: " สมหญิง ", note: "แก้ PO" }));
+  const m = byDoc(D.r1.doc_no);
+  assert.deepStrictEqual([m.person, m.note, m.qty], ["สมหญิง", "แก้ PO", 10]);
+  assert.strictEqual(lastLog().detail, `แก้ไขรายการ ${D.r1.doc_no} (รับเข้า RM ขนาด 1.2x1.2): ผู้ทำรายการ "" → "สมหญิง"; หมายเหตุ "" → "แก้ PO"`);
+  assert.strictEqual(lastLog().actor, "Editor");
+  for (const f of [{ type_id: 2 }, { size: "1.1x1.1" }, { from_status: "damaged" }, { to_status: "issued" }]) {
+    err(rec("movement_update", Object.assign({ id: D.r1.id }, f)), /ลบรายการนี้แล้วบันทึกใหม่/);
+  }
+  okData(rec("movement_update", { id: D.r1.id, type_id: 1, size: "1.2x1.2", to_status: "available" })); // same values are fine
+  const logs = dataRows("audit_logs");
+  const same = okData(rec("movement_update", { id: D.r1.id, qty: 10, person: "สมหญิง", date: "2026-01-10", time: "08:00" }));
+  assert.deepStrictEqual(same, { changed: false, message: "ไม่มีการเปลี่ยนแปลง" });
+  assert.strictEqual(dataRows("audit_logs"), logs);
+  err(rec("movement_update", { id: D.r1.id, note: "x".repeat(256) }), /ยาวเกิน 255/);
+});
+
+test("repair chain: date out of chain order is rejected even when stock allows it", () => {
+  // Z keeps 3 pallets "damaged" at 08:30, so moving Y's repair_start to 08:45 (before Y's damage at 09:00) keeps stock >= 0
+  const before = JSON.parse(sheetDump()).slice(0, 2);
+  err(rec("movement_update", { id: D.yRp.id, date: "2026-02-04", time: "08:45" }),
+    new RegExp(`^แก้ไขไม่ได้: ลำดับเวลาของงานซ่อม ${D.y.ticket_no} ไม่ถูกต้อง`));
+  err(rec("movement_update", { id: D.yRp.id, date: "2026-02-04", time: "08:00" }),
+    /^แก้ไขไม่ได้: ยอดชำรุด PK 1\.1x1\.1 จะติดลบ \(-3\) ณ วันที่ 04\/02\/2026 08:00/);
+  assert.deepStrictEqual(JSON.parse(sheetDump()).slice(0, 2), before);
+  okData(rec("movement_update", { id: D.yRp.id, date: "2026-02-04", time: "11:00" }));
+  assert.strictEqual(ticketOf(D.y.id).started_at, "2026-02-04 11:00:00");
+  okData(rec("movement_update", { id: D.yDm.id, date: "2026-02-04", time: "09:15" }));
+  assert.strictEqual(ticketOf(D.y.id).reported_at, "2026-02-04 09:15:00");
+});
+
+test("repair chain: qty edit propagates to every chain movement and the ticket; too large rejected", () => {
+  const d = okData(rec("movement_update", { id: D.yRp.id, qty: 4 })); // edit via the repair_start row
+  assert.strictEqual(d.changed, true);
+  assert.deepStrictEqual([byDoc(D.yDm.doc_no).qty, byDoc(D.yRp.doc_no).qty, ticketOf(D.y.id).qty], [4, 4, 4]);
+  const b = st();
+  assert.strictEqual(stockOf(b.stock, 2, "1.1x1.1", "repairing"), 4);
+  assert.strictEqual(stockOf(b.stock, 2, "1.1x1.1", "available"), 3);
+  assert.ok(lastLog().detail.includes(`จำนวน 3 → 4 · ปรับจำนวนทั้งชุดงานซ่อม ${D.y.ticket_no} (2 รายการ + ใบแจ้งซ่อม)`), lastLog().detail);
+  const before = JSON.parse(sheetDump()).slice(0, 2);
+  err(rec("movement_update", { id: D.yDm.id, qty: 50 }), /^แก้ไขไม่ได้: ยอดพร้อมใช้ PK 1\.1x1\.1 จะติดลบ/);
+  assert.deepStrictEqual(JSON.parse(sheetDump()).slice(0, 2), before);
+  // department of a damage-from-issued chain movement is synced to the ticket, and checked
+  err(rec("movement_update", { id: D.xDm.id, department: "ฝ่ายผลิต" }), /^แก้ไขไม่ได้: ยอดพาเลท PK 1\.1x1\.1 ที่ ฝ่ายผลิต ถืออยู่ จะติดลบ \(-4\) ณ วันที่ 02\/02\/2026 08:00/);
+  err(rec("movement_update", { id: D.zDm.id, department: "ฝ่ายผลิต" }), /ไม่มีฝ่ายให้แก้ไข/); // damage from stock has no dept
+});
+
+test("repair_update: cause / reported_by / repairer / note only; audit before→after", () => {
+  const d = okData(rec("repair_update", { id: D.x.id, ticket_no: D.x.ticket_no, cause: "ไม้หักสองแผ่น", repairer: "ช่างสอง", reported_by: "ผู้แจ้ง", note: "บันทึก\nบรรทัดสอง" }));
+  assert.strictEqual(d.message, "แก้ไขใบแจ้งซ่อม " + D.x.ticket_no + " แล้ว");
+  const t = ticketOf(D.x.id);
+  assert.deepStrictEqual([t.cause, t.repairer, t.reported_by, t.note, t.qty, t.stage], ["ไม้หักสองแผ่น", "ช่างสอง", "ผู้แจ้ง", "บันทึก\nบรรทัดสอง", 4, "done"]);
+  const log = lastLog();
+  assert.strictEqual(log.category, "repair");
+  assert.strictEqual(log.action, "แก้ไขใบแจ้งซ่อม");
+  assert.strictEqual(log.ref, D.x.ticket_no);
+  assert.ok(log.detail.startsWith(`แก้ไขใบแจ้งซ่อม ${D.x.ticket_no}: สาเหตุการชำรุด "หัก" → "ไม้หักสองแผ่น"; ผู้แจ้ง "" → "ผู้แจ้ง"; ช่างผู้ซ่อม "" → "ช่างสอง"`), log.detail);
+  err(rec("repair_update", { id: D.x.id, qty: 9 }), /แก้ไขจำนวน\/สถานะ/);
+  err(rec("repair_update", { id: D.x.id, stage: "damaged" }), /แก้ไขจำนวน\/สถานะ/);
+  err(rec("repair_update", { id: D.x.id, note: "x".repeat(1001) }), /ยาวเกิน 1000/);
+  err(rec("repair_update", { id: D.x.id, ticket_no: "RPR-000000-0001", cause: "a" }), /ไม่พบใบแจ้งซ่อม/);
+  assert.deepStrictEqual(okData(rec("repair_update", { id: D.x.id, cause: "ไม้หักสองแผ่น" })).changed, false);
+  assert.strictEqual(lastLog().detail, "ปฏิเสธแก้ไขใบแจ้งซ่อม: ไม่พบใบแจ้งซ่อมนี้ (อาจถูกลบไปแล้ว) กรุณาโหลดหน้าใหม่");
+});
+
+test("delete a chain that would make stock negative is rejected (repaired pallets were re-issued)", () => {
+  const before = JSON.parse(sheetDump()).slice(0, 2);
+  err(rec("movement_delete", { id: D.xRd.id, doc_no: D.xRd.doc_no }),
+    new RegExp(`^ลบไม่ได้: ยอดพร้อมใช้ PK 1\\.1x1\\.1 จะติดลบ \\(-4\\) ณ วันที่ 03/02/2026 08:00 \\(${D.p3.doc_no}\\)`));
+  err(rec("repair_delete", { id: D.x.id }), /^ลบไม่ได้: ยอดพร้อมใช้ PK/);
+  assert.deepStrictEqual(JSON.parse(sheetDump()).slice(0, 2), before);
+});
+
+test("delete a repair-chain movement removes the whole chain and its ticket", () => {
+  const nMv = dataRows("movements"), nRp = dataRows("repairs");
+  const d = okData(rec("movement_delete", { id: D.yDm.id, doc_no: D.yDm.doc_no }));
+  assert.deepStrictEqual(d.removed, { movements: 2, repairs: 1 });
+  assert.strictEqual(d.message, `ลบงานซ่อม ${D.y.ticket_no} ทั้งชุดแล้ว (ใบแจ้งซ่อม + 2 รายการเคลื่อนไหว)`);
+  assert.strictEqual(dataRows("movements"), nMv - 2);
+  assert.strictEqual(dataRows("repairs"), nRp - 1);
+  assert.ok(!byDoc(D.yDm.doc_no) && !byDoc(D.yRp.doc_no));
+  assert.ok(!ticketOf(D.y.id));
+  assert.ok(!hist().some(m => m.repair_id === D.y.id));
+  const b = st();
+  assert.strictEqual(stockOf(b.stock, 2, "1.1x1.1", "repairing"), 0);
+  assert.strictEqual(stockOf(b.stock, 2, "1.1x1.1", "damaged"), 3);
+  assert.strictEqual(stockOf(b.stock, 2, "1.1x1.1", "available"), 7);
+  const log = lastLog();
+  assert.strictEqual(log.category, "pallet");
+  assert.strictEqual(log.action, "ลบรายการ");
+  assert.strictEqual(log.ref, D.y.ticket_no);
+  assert.ok(log.detail.startsWith(`ลบรายการทั้งชุดงานซ่อม ${D.y.ticket_no} (PK ขนาด 1.1x1.1): ใบแจ้งซ่อม + 2 รายการ — ${D.yDm.doc_no} แจ้งชำรุด 4 ตัว`), log.detail);
+  // repair_delete from the repairs page (ticket Z: single damage movement)
+  const r = okData(rec("repair_delete", { id: D.z.id, ticket_no: D.z.ticket_no }));
+  assert.deepStrictEqual(r.removed, { movements: 1, repairs: 1 });
+  assert.strictEqual(stockOf(st().stock, 2, "1.1x1.1", "damaged"), 0);
+  // new tickets / docs don't reuse deleted numbers
+  okData(post("damage", Object.assign({ type_id: 2, size: "1.1x1.1", qty: 1 }, AT)));
+  const t = rowsOf("repairs").pop();
+  assert.strictEqual(t.ticket_no, "RPR-" + YMD + "-0004");
+  assert.strictEqual(byDoc(doc("DM", 4)).repair_id, t.id);
+  okData(rec("repair_delete", { id: t.id }));
+});
+
+test("deleting the last data rows keeps a spare sheet row (Sheets cannot delete all non-frozen rows)", () => {
+  okData(rec("movement_delete", { id: D.p3.id })); // frees the re-issued pallets so chain X can go
+  const s = sheet("repairs");
+  assert.strictEqual(dataRows("repairs"), 1);
+  s.maxRows = s.getLastRow(); // header + 1 row, nothing spare
+  const d = okData(rec("repair_delete", { id: D.x.id, ticket_no: D.x.ticket_no }));
+  assert.deepStrictEqual(d.removed, { movements: 3, repairs: 1 });
+  assert.strictEqual(dataRows("repairs"), 0);
+  assert.ok(s.maxRows >= 2);
+  assert.deepStrictEqual(okData(get("repairs")).items, []);
+  const b = st();
+  assert.strictEqual(stockOf(b.stock, 2, "1.1x1.1", "available"), 20);
+  assert.strictEqual(stockOf(b.stock, 2, "1.1x1.1", "issued"), 10);
+  // every movement row still parses to a consistent ledger (replay of all data is non-negative)
+  const bal = {};
+  hist().slice().reverse().forEach(m => {
+    if (m.to_status) bal[m.type_id + m.size + m.to_status] = (bal[m.type_id + m.size + m.to_status] || 0) + m.qty;
+    if (m.from_status) bal[m.type_id + m.size + m.from_status] = (bal[m.type_id + m.size + m.from_status] || 0) - m.qty;
+    assert.ok(Object.values(bal).every(v => v >= 0), "negative at " + m.doc_no);
+  });
+  assert.strictEqual(state.locks, state.unlocks);
+});
+
 /* ---------- frontend syntax ---------- */
 test("docs JS files parse (new Function)", () => {
   for (const f of ["docs/config.js", "docs/assets/app.js"]) {
@@ -787,6 +1115,12 @@ test("docs JS files parse (new Function)", () => {
   assert.ok(!/api\.php|X-User|localStorage\.setItem\([^)]*[Pp]ass/.test(app));
   assert.ok(app.includes("action: 'reset_data', resetPassword"));
   assert.ok(!/(local|session)Storage\.setItem\([^)]*[Rr]eset|sessionSet\([^)]*[Rr]eset/.test(app)); // reset password never stored
+  assert.ok(!/(local|session)Storage\.setItem\([^)]*[Rr]ecord|sessionSet\([^)]*[Rr]ecord|store\('set', *'[^']*[Pp]ass/.test(app));
+  for (const a of ["movement_update", "movement_delete", "repair_update", "repair_delete", "verifyResetPassword"]) assert.ok(app.includes(`'${a}'`), a);
+  assert.ok(app.includes("resetPassword: pw }"));
+  assert.ok(/data-medit=.*✏️ แก้ไข/.test(app) && /data-mdel=.*🗑 ลบ/.test(app) && /data-redit=.*data-rdel=/.test(app));
+  const html = fs.readFileSync(path.join(ROOT, "docs/index.html"), "utf8");
+  assert.ok(html.includes('assets/app.js?v=13"'));
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
