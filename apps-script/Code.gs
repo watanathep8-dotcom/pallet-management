@@ -8,6 +8,10 @@
  * Project Settings > Script properties > PALLET_ACTION_PASSWORD and deploy as
  * a web app (Execute as: me, Who has access: Anyone).
  *
+ * Optional: set Script property PALLET_RESET_PASSWORD (a separate password)
+ * to enable the "reset_data" action, which wipes movements, repairs and
+ * audit_logs (pallet types and departments are kept).
+ *
  * Transport:
  *   GET  ?action=<read action>&...params        -> {ok:true,data} | {ok:false,error}
  *   POST text/plain JSON {action, password, actor, ...fields}
@@ -25,6 +29,13 @@ var ACTION_PASSWORD_PROPERTY = "PALLET_ACTION_PASSWORD";
 var PASSWORD_FAIL_CACHE_KEY = "PALLET_PASSWORD_FAILURES";
 var PASSWORD_MAX_FAILURES = 10;
 var PASSWORD_LOCK_SECONDS = 900;
+
+// Separate password (Script Property only) for wiping test data, with its own
+// lockout counter so it cannot be guessed via, or lock out, normal writes.
+var RESET_ACTION = "reset_data";
+var RESET_PASSWORD_PROPERTY = "PALLET_RESET_PASSWORD";
+var RESET_FAIL_CACHE_KEY = "PALLET_RESET_FAILURES";
+var RESET_TABLES = ["movements", "repairs", "audit_logs"]; // pallet_types/departments are kept
 
 // Asia/Bangkok has no daylight saving time, so a fixed +07:00 offset gives the
 // same wall-clock values as PHP's date_default_timezone_set('Asia/Bangkok').
@@ -104,7 +115,7 @@ function doGet(e) {
   var action = String(params.action || "");
   try {
     if (!action) return jsonResponse_({ ok: true, data: { service: "Pallet Hub API" } });
-    if (WRITE_ACTIONS.indexOf(action) !== -1 || action === "verifyPassword") {
+    if (WRITE_ACTIONS.indexOf(action) !== -1 || action === "verifyPassword" || action === RESET_ACTION) {
       throw new Error("คำสั่งนี้ต้องส่งแบบ POST");
     }
     resetRequest_("");
@@ -128,17 +139,22 @@ function doPost(e) {
     if (action === "verifyPassword") {
       return jsonResponse_({ ok: true, data: verifyActionPassword(payload.password) });
     }
-    if (WRITE_ACTIONS.indexOf(action) === -1) {
-      if (READ_ACTIONS.indexOf(action) !== -1) {
-        resetRequest_("");
-        return jsonResponse_({ ok: true, data: handleRead_(action, payload) });
+    if (action === RESET_ACTION) {
+      // Uses ONLY the reset password (PALLET_ACTION_PASSWORD is not required).
+      assertResetPassword_(payload.resetPassword);
+    } else {
+      if (WRITE_ACTIONS.indexOf(action) === -1) {
+        if (READ_ACTIONS.indexOf(action) !== -1) {
+          resetRequest_("");
+          return jsonResponse_({ ok: true, data: handleRead_(action, payload) });
+        }
+        throw new Error("Unknown action");
       }
-      throw new Error("Unknown action");
+      // Checked before taking the lock so password guessing (with its 1 s delay)
+      // never blocks legitimate writers. Wrong passwords are not written to the
+      // audit log: unauthenticated requests must not be able to write the sheet.
+      assertActionPassword_(payload.password);
     }
-    // Checked before taking the lock so password guessing (with its 1 s delay)
-    // never blocks legitimate writers. Wrong passwords are not written to the
-    // audit log: unauthenticated requests must not be able to write the sheet.
-    assertActionPassword_(payload.password);
   } catch (error) {
     return errorResponse_(error);
   }
@@ -184,20 +200,31 @@ function verifyActionPassword(password) {
 }
 
 function assertActionPassword_(password) {
-  var expected = PropertiesService.getScriptProperties().getProperty(ACTION_PASSWORD_PROPERTY) || "";
-  if (!expected) {
-    throw passwordError_("ยังไม่ได้ตั้งรหัสผ่านใน Script Properties (" + ACTION_PASSWORD_PROPERTY +
-      ") กรุณาให้ผู้ดูแลระบบตั้งค่าที่ Project Settings > Script properties ก่อนบันทึกข้อมูล");
-  }
+  checkPassword_(password, ACTION_PASSWORD_PROPERTY, PASSWORD_FAIL_CACHE_KEY,
+    "ยังไม่ได้ตั้งรหัสผ่านใน Script Properties (" + ACTION_PASSWORD_PROPERTY +
+    ") กรุณาให้ผู้ดูแลระบบตั้งค่าที่ Project Settings > Script properties ก่อนบันทึกข้อมูล");
+}
+
+function assertResetPassword_(password) {
+  checkPassword_(password, RESET_PASSWORD_PROPERTY, RESET_FAIL_CACHE_KEY,
+    "ยังไม่ได้ตั้งรหัสรีเซ็ตข้อมูลใน Script Properties (" + RESET_PASSWORD_PROPERTY +
+    ") กรุณาให้ผู้ดูแลระบบตั้งค่าที่ Project Settings > Script properties ก่อนใช้งานรีเซ็ตข้อมูล");
+}
+
+// Shared check: property must be set; >10 wrong attempts per 15 min (counted
+// under failKey) locks the check; every wrong attempt costs 1 s.
+function checkPassword_(password, property, failKey, missingMessage) {
+  var expected = PropertiesService.getScriptProperties().getProperty(property) || "";
+  if (!expected) throw passwordError_(missingMessage);
 
   var cache = CacheService.getScriptCache();
-  var failures = Number(cache.get(PASSWORD_FAIL_CACHE_KEY) || 0);
+  var failures = Number(cache.get(failKey) || 0);
   if (failures >= PASSWORD_MAX_FAILURES) {
     throw passwordError_("ใส่รหัสผิดหลายครั้งเกินไป กรุณารอ 15 นาที / Too many wrong attempts. Try again in 15 minutes.");
   }
 
   if (String(password == null ? "" : password) !== expected) {
-    cache.put(PASSWORD_FAIL_CACHE_KEY, String(failures + 1), PASSWORD_LOCK_SECONDS);
+    cache.put(failKey, String(failures + 1), PASSWORD_LOCK_SECONDS);
     Utilities.sleep(1000);
     throw passwordError_("รหัสไม่ถูกต้อง / Incorrect password.");
   }
@@ -235,6 +262,7 @@ function handleWrite_(action, input) {
     case "scrap": return actionScrap_(input);
     case "dept_save": return actionDeptSave_(input);
     case "dept_delete": return actionDeptDelete_(input);
+    case RESET_ACTION: return actionResetData_();
   }
   fail_("Unknown action");
 }
@@ -565,6 +593,36 @@ function actionDeptDelete_(input) {
   update_("departments", dept, { active: 0 });
   audit_("setting", "dept_delete", "ลบฝ่าย: " + dept.name);
   return { message: "ลบฝ่ายแล้ว" };
+}
+
+// Wipes all data rows (header row and cell formats are kept) of the
+// transactional sheets. Runs under the script lock (runWrite_).
+function actionResetData_() {
+  var removed = {};
+  RESET_TABLES.forEach(function (name) {
+    var sheet = db_().getSheetByName(name);
+    if (!sheet) throw new Error('ไม่พบชีต "' + name + '" กรุณารัน setupSystem() อีกครั้ง');
+    var n = Math.max(0, sheet.getLastRow() - 1);
+    if (n > 0) {
+      var width = Math.max(sheet.getLastColumn(), SCHEMA[name].length);
+      sheet.getRange(2, 1, n, width).clearContent(); // one call; keeps number formats
+    }
+    removed[name] = n;
+    // Drop anything cached/buffered for this sheet so ids and doc numbers
+    // are recomputed from the now-empty sheet (next id 1, next doc -0001).
+    delete REQ_.tables[name];
+    delete REQ_.appends[name];
+  });
+  REQ_.updates = REQ_.updates.filter(function (u) { return RESET_TABLES.indexOf(u.name) === -1; });
+
+  audit_("setting", "รีเซ็ตข้อมูล",
+    "รีเซ็ตข้อมูล: ล้างชีต movements (" + removed.movements + " แถว), repairs (" + removed.repairs +
+    " แถว), audit_logs (" + removed.audit_logs + " แถว) · คงไว้: pallet_types, departments");
+  return {
+    removed: removed,
+    message: "รีเซ็ตข้อมูลแล้ว — ลบประวัติเคลื่อนไหว " + removed.movements + " แถว, งานซ่อม " +
+      removed.repairs + " แถว, บันทึกประวัติ " + removed.audit_logs + " แถว"
+  };
 }
 
 /* ===================== business helpers ===================== */

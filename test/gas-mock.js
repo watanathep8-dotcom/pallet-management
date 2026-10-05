@@ -56,6 +56,14 @@ function createGas() {
       return this;
     }
     setFontWeight() { return this; }
+    clearContent() {
+      state.clearCalls = (state.clearCalls || 0) + 1;
+      for (let r = 0; r < this.nr; r++) {
+        const line = this.sheet.data[this.row - 1 + r];
+        if (line) for (let c = 0; c < this.nc; c++) if (this.col - 1 + c < line.length) line[this.col - 1 + c] = "";
+      }
+      return this;
+    }
   }
 
   class Sheet {
@@ -641,6 +649,130 @@ test("reads work without any password", () => {
   for (const a of ["bootstrap", "dashboard", "repairs", "history", "export", "logs", "logs_export"]) okData(get(a));
 });
 
+/* ---------- reset data ---------- */
+const RPW = "reset-Only-9";
+const reset = (pw, extra = {}) => postRaw(Object.assign({ action: "reset_data", resetPassword: pw, actor: "Admin" }, extra));
+const snapshot = () => ["movements", "repairs", "audit_logs", "pallet_types", "departments"].map(dataRows);
+
+test("reset_data refused while PALLET_RESET_PASSWORD is unset (Thai admin message); GET refused", () => {
+  assert.ok(!("PALLET_RESET_PASSWORD" in state.props));
+  const before = snapshot();
+  const r = err(reset(PW, { password: PW }), /PALLET_RESET_PASSWORD/);
+  assert.ok(/ยังไม่ได้ตั้งรหัสรีเซ็ตข้อมูล/.test(r.error));
+  assert.strictEqual(r.passwordError, true);
+  err(get("reset_data"), /POST/);
+  assert.deepStrictEqual(snapshot(), before);
+});
+
+test("reset_data with wrong password (or the action password) is refused, slept, own lockout key", () => {
+  state.props.PALLET_RESET_PASSWORD = RPW;
+  state.cache = {};
+  const before = snapshot();
+  const sleeps = state.sleeps;
+  const r = err(reset("wrong"), /รหัสไม่ถูกต้อง/);
+  assert.strictEqual(r.passwordError, true);
+  assert.strictEqual(state.sleeps - sleeps, 1000);
+  err(reset(PW, { password: PW }), /รหัสไม่ถูกต้อง/); // action password is not the reset password
+  err(postRaw({ action: "reset_data", password: RPW }), /รหัสไม่ถูกต้อง/); // must come in resetPassword
+  assert.strictEqual(state.cache.PALLET_RESET_FAILURES, "3");
+  assert.ok(!("PALLET_PASSWORD_FAILURES" in state.cache));
+  assert.deepStrictEqual(snapshot(), before);
+  state.cache = {};
+});
+
+test("reset_data lockout: >10 wrong in 15 min refuses even the right reset password; normal writes unaffected", () => {
+  state.cache = {};
+  state.cachePuts = [];
+  for (let i = 0; i < 10; i++) err(reset("guess" + i), /รหัสไม่ถูกต้อง/);
+  assert.ok(state.cachePuts.every(t => t === 900));
+  const before = snapshot();
+  const r = err(reset(RPW), /หลายครั้งเกินไป/);
+  assert.strictEqual(r.passwordError, true);
+  assert.deepStrictEqual(snapshot(), before);
+  okData(postRaw({ action: "verifyPassword", password: PW })); // separate counter
+  state.cache = {}; // 15 minutes later
+});
+
+let resetResult;
+test("reset_data success: clears movements/repairs/audit_logs (one clear per sheet), keeps types & departments, no action password needed", () => {
+  const [mv, rp, lg, ty, dp] = snapshot();
+  assert.ok(mv > 0 && rp > 0 && lg > 0);
+  const before = okData(get("bootstrap"));
+  const headers = ["movements", "repairs", "audit_logs"].map(n => sheet(n).data[0].slice());
+  const locks = state.locks, clears = state.clearCalls || 0;
+  resetResult = okData(reset(RPW)); // payload has no "password" field
+  assert.deepStrictEqual(resetResult.removed, { movements: mv, repairs: rp, audit_logs: lg });
+  assert.ok(/รีเซ็ตข้อมูลแล้ว/.test(resetResult.message));
+  assert.strictEqual(state.clearCalls - clears, 3);
+  assert.strictEqual(state.locks - locks, 1);
+  assert.strictEqual(state.locks, state.unlocks);
+  assert.deepStrictEqual(snapshot(), [0, 0, 1, ty, dp]); // audit_logs holds only the reset entry
+  assert.deepStrictEqual(["movements", "repairs", "audit_logs"].map(n => sheet(n).data[0]), headers);
+  const b = okData(get("bootstrap"));
+  assert.deepStrictEqual(b.departments, before.departments);
+  assert.deepStrictEqual(b.types, before.types);
+});
+
+test("after reset: audit log contains exactly the reset entry", () => {
+  const items = okData(get("logs")).items;
+  assert.strictEqual(items.length, 1);
+  const l = items[0];
+  assert.strictEqual(l.id, 1);
+  assert.strictEqual(l.category, "setting");
+  assert.strictEqual(l.action, "รีเซ็ตข้อมูล");
+  assert.strictEqual(l.actor, "Admin");
+  assert.strictEqual(l.ref, "");
+  ["movements", "repairs", "audit_logs"].forEach(n => assert.ok(l.detail.includes(n), n));
+  assert.ok(l.detail.includes("(" + resetResult.removed.movements + " แถว)"));
+  assert.strictEqual(sheet("audit_logs").getLastRow(), 2); // written right under the header
+});
+
+test("after reset: stock, dept, repairs, history and dashboard are all zero/empty", () => {
+  const b = okData(get("bootstrap"));
+  assert.deepStrictEqual(b.stock, {});
+  assert.deepStrictEqual(b.dept, []);
+  assert.deepStrictEqual(okData(get("repairs")).items, []);
+  assert.deepStrictEqual(okData(get("history")).items, []);
+  const d = okData(get("dashboard"));
+  assert.deepStrictEqual(d.stock, {});
+  assert.deepStrictEqual(d.dept, []);
+  assert.deepStrictEqual(d.today, []);
+  assert.deepStrictEqual(d.recent, []);
+  assert.deepStrictEqual(d.repairs, []);
+  assert.deepStrictEqual(d.topDept, []);
+  assert.ok(Object.values(d.days).every(v => Object.values(v).every(n => n === 0)));
+  assert.ok(d.hours.every(h => h.in === 0 && h.out === 0));
+  assert.deepStrictEqual(d.repairStat, { avg_h: null, open_n: 0, done_m: 0, scrap_m: 0, oldest: null });
+  assert.strictEqual(d.logsToday, 1);
+});
+
+test("after reset: numbering restarts (RC/IS/DM/RPR -0001, ids from 1) and flows work", () => {
+  const d = okData(post("receive", Object.assign({ type_id: 1, size: "1.2x1.2", qty: 10, person: "P" }, AT)));
+  assert.strictEqual(d.doc_no, "RC-" + YMD + "-0001");
+  assert.strictEqual(d.id, 1);
+  assert.strictEqual(sheet("movements").getLastRow(), 2);
+  assert.strictEqual(okData(post("issue", Object.assign({ type_id: 1, size: "1.2x1.2", qty: 4, department: "ฝ่ายบรรจุ" }, AT))).doc_no, "IS-" + YMD + "-0001");
+  assert.strictEqual(okData(post("damage", Object.assign({ type_id: 1, size: "1.2x1.2", qty: 1, cause: "x" }, AT))).doc_no, "DM-" + YMD + "-0001");
+  const t = okData(get("repairs")).items;
+  assert.strictEqual(t.length, 1);
+  assert.strictEqual(t[0].id, 1);
+  assert.strictEqual(t[0].ticket_no, "RPR-" + YMD + "-0001");
+  const b = okData(get("bootstrap"));
+  assert.strictEqual(stockOf(b.stock, 1, "1.2x1.2", "available"), 5);
+  assert.strictEqual(stockOf(b.stock, 1, "1.2x1.2", "issued"), 4);
+  assert.strictEqual(stockOf(b.stock, 1, "1.2x1.2", "damaged"), 1);
+  const logs = okData(get("logs")).items;
+  assert.deepStrictEqual(logs.map(l => l.id), [4, 3, 2, 1]);
+  assert.strictEqual(logs[3].action, "รีเซ็ตข้อมูล");
+});
+
+test("reset_data on already-empty sheets reports zero rows removed", () => {
+  okData(reset(RPW));
+  const r = okData(reset(RPW));
+  assert.deepStrictEqual(r.removed, { movements: 0, repairs: 0, audit_logs: 1 });
+  assert.strictEqual(okData(get("logs")).items.length, 1);
+});
+
 /* ---------- frontend syntax ---------- */
 test("docs JS files parse (new Function)", () => {
   for (const f of ["docs/config.js", "docs/assets/app.js"]) {
@@ -649,9 +781,12 @@ test("docs JS files parse (new Function)", () => {
   }
   const cfg = {};
   new Function("window", fs.readFileSync(path.join(ROOT, "docs/config.js"), "utf8"))(cfg);
-  assert.deepStrictEqual(cfg.PALLET_CONFIG, { apiUrl: "" });
+  assert.deepStrictEqual(Object.keys(cfg.PALLET_CONFIG), ["apiUrl"]);
+  assert.ok(cfg.PALLET_CONFIG.apiUrl === "" || /^https:\/\/script\.google\.com\/macros\/s\/[\w-]+\/exec$/.test(cfg.PALLET_CONFIG.apiUrl));
   const app = fs.readFileSync(path.join(ROOT, "docs/assets/app.js"), "utf8");
   assert.ok(!/api\.php|X-User|localStorage\.setItem\([^)]*[Pp]ass/.test(app));
+  assert.ok(app.includes("action: 'reset_data', resetPassword"));
+  assert.ok(!/(local|session)Storage\.setItem\([^)]*[Rr]eset|sessionSet\([^)]*[Rr]eset/.test(app)); // reset password never stored
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

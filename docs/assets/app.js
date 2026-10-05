@@ -854,7 +854,11 @@ async function settings() {
       <div class="field mt"><label>ไอคอน</label><div class="icon-pick">${icons.map(i => `<button data-ic="${i}" class="${i === ic ? 'sel' : ''}"><i class="fa-solid ${i}"></i></button>`).join('')}</div></div>
       <div class="field mt"><label>สี</label><div class="color-pick">${colors.map(c => `<button data-col="${c}" style="--c:${c}" class="${c === col ? 'sel' : ''}"></button>`).join('')}</div></div>
       <button class="btn btn-primary mt" id="dSave" style="width:100%"><i class="fa-solid fa-floppy-disk"></i>บันทึก</button>
-    </div></div>`;
+    </div></div>
+    <div class="card mt" style="border:2px solid var(--bad)"><h3><i class="fa-solid fa-triangle-exclamation" style="color:var(--bad)"></i>ล้างข้อมูลทดสอบ<span class="sub">ย้อนกลับไม่ได้</span></h3>
+      <p style="color:var(--muted)">ลบประวัติเคลื่อนไหว งานซ่อม และบันทึกประวัติ (Log) ทั้งหมด เพื่อเริ่มใช้งานใหม่ — ประเภทพาเลทและรายชื่อฝ่ายยังอยู่ ต้องใช้รหัสรีเซ็ตข้อมูล (แยกจากรหัสบันทึกปกติ)</p>
+      <button class="btn btn-bad mt" id="resetBtn">🗑 รีเซ็ตข้อมูล / Reset data</button>
+    </div>`;
   view.onclick = async e => {
     const i = e.target.closest('[data-ic]'), c = e.target.closest('[data-col]'), d = e.target.closest('[data-del]');
     if (i) { ic = i.dataset.ic; $$('[data-ic]').forEach(x => x.classList.toggle('sel', x === i)); }
@@ -868,6 +872,51 @@ async function settings() {
     try { const r = await api('dept_save', { name: $('#dName').value, icon: ic, color: col }); toast(r.message); route(); }
     catch (e) { toast(e.message, 'err'); }
   };
+  $('#resetBtn').onclick = resetData;
+}
+
+/* รีเซ็ตข้อมูล: ถามรหัสรีเซ็ต (ใช้ครั้งเดียว ไม่เก็บไว้) → ยืนยัน → POST reset_data */
+const RESET_CONFIRM = [
+  'ยืนยันการรีเซ็ตข้อมูล?',
+  '',
+  'ระบบจะลบข้อมูลต่อไปนี้ทั้งหมด:',
+  '• ประวัติเคลื่อนไหวพาเลท (movements) — ยอดคงเหลือทุกประเภทจะกลับเป็น 0',
+  '• ใบแจ้งซ่อม / งานซ่อม (repairs)',
+  '• บันทึกประวัติ (audit_logs)',
+  '',
+  'ข้อมูลที่ยังเก็บไว้: ประเภทพาเลท และรายชื่อฝ่าย',
+  '',
+  'การลบนี้ย้อนกลับไม่ได้ ต้องการดำเนินการต่อหรือไม่?',
+].join('\n');
+function resetData() {
+  const m = modal(`<h3><i class="fa-solid fa-trash-can" style="color:var(--bad)"></i> รีเซ็ตข้อมูล / Reset data</h3>
+    <p style="color:var(--muted)">ใส่รหัสรีเซ็ตข้อมูล (ตั้งโดยผู้ดูแลระบบ — คนละรหัสกับรหัสบันทึกข้อมูล)</p>
+    <div class="field mt"><label>รหัสรีเซ็ตข้อมูล</label><input type="password" id="rPw" autocomplete="off"></div>
+    <div id="rErr" style="color:var(--bad);min-height:20px;margin-top:8px;font-size:13px"></div>
+    <div class="modal-acts"><button class="btn btn-ghost" data-close>ยกเลิก</button><button class="btn btn-bad" id="rGo"><i class="fa-solid fa-trash-can"></i>รีเซ็ตข้อมูล</button></div>`);
+  const inp = $('#rPw', m), go = $('#rGo', m), err = $('#rErr', m);
+  const idle = () => { go.disabled = false; go.innerHTML = '<i class="fa-solid fa-trash-can"></i>รีเซ็ตข้อมูล'; };
+  const submit = async () => {
+    if (go.disabled) return;
+    let pw = inp.value;
+    if (!pw) { err.textContent = 'กรุณาใส่รหัสรีเซ็ตข้อมูล'; inp.focus(); return; }
+    if (!confirm(RESET_CONFIRM)) { inp.focus(); return; }
+    go.disabled = true; go.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> กำลังรีเซ็ต...'; err.textContent = '';
+    try {
+      const r = await gasPost({ action: 'reset_data', resetPassword: pw, actor: S.user || '' });
+      pw = ''; inp.value = '';
+      closeModal();
+      const c = r.removed || {};
+      toast(`รีเซ็ตข้อมูลแล้ว — ลบประวัติเคลื่อนไหว ${fmt(c.movements)} · งานซ่อม ${fmt(c.repairs)} · Log ${fmt(c.audit_logs)} แถว`);
+      route(); // โหลดข้อมูล (bootstrap) และหน้าปัจจุบันใหม่ทั้งหมด
+    } catch (e) {
+      pw = ''; inp.value = '';
+      err.textContent = e.message; idle(); inp.focus();
+    }
+  };
+  go.onclick = submit;
+  inp.onkeydown = e => { if (e.key === 'Enter') submit(); };
+  inp.focus();
 }
 
 route();
