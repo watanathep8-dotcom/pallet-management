@@ -409,6 +409,8 @@ let routeSeq = 0;
 // Pages behind the reset password, and pages that need the user's name first.
 const PW_PAGES = ['logs', 'settings'];
 const NAME_PAGES = ['receive', 'issue', 'return', 'damage', 'repair'];
+// หน้าที่มีช่องกรอก/ตัวกรอง: ข้อมูลใหม่ไม่วาดทับเมื่อผู้ใช้เริ่มกรอกแล้ว (หน้าอื่นวาดใหม่ตามข้อมูลล่าสุดเสมอ)
+const INPUT_PAGES = ['receive', 'issue', 'return', 'damage', 'history', 'settings'];
 async function route() {
   const p = currentPage();
   if (PW_PAGES.includes(p)) {
@@ -447,7 +449,7 @@ async function route() {
     if (seq !== routeSeq) return; // เปลี่ยนหน้าไปแล้ว
     res.forEach((d, i) => rcPut(reads[i], d));
     if (shown === sigOf(res)) { applyBoot(res[0]); return; }
-    if (shown !== null && (S.dirty || p === 'logs')) { applyBoot(res[0]); updateBadge(); S.onFresh?.(); return; } // Log: ไม่โหลดซ้ำ
+    if (shown !== null && ((S.dirty && INPUT_PAGES.includes(p)) || p === 'logs')) { applyBoot(res[0]); updateBadge(); S.onFresh?.(); return; } // Log: ไม่โหลดซ้ำ
     await paint(res);
   } catch (e) {
     if (seq !== routeSeq) return;
@@ -744,12 +746,16 @@ function txForm(kind) {
   const f = { type_id: null, size: null, qty: 1, department: null, condition: 'good', ...nowParts() };
   const avail = (t, s) => kind === 'return' ? (f.department ? deptQty(f.department, t, s) : 0) : q(t, s, cfg.from);
   const availType = t => sizes(typeById(t)).reduce((a, s) => a + avail(t, s), 0);
+  // รับคืน: ฝ่ายที่ถูกลบไปแล้วแต่ยังถือพาเลทอยู่ ต้องเลือกคืนได้
+  const deptList = kind === 'return'
+    ? [...S.depts, ...[...new Set(S.dept.map(r => r.department))].filter(n => !S.depts.some(d => d.name === n)).map(name => ({ name, icon: 'fa-building', color: '#667085' }))]
+    : S.depts;
 
   view.innerHTML = `
   <div class="wizard">
     <div class="card">
       ${cfg.dept ? `<div class="step" id="stDept"><div class="step-h"><span class="n">1</span>${kind === 'issue' ? 'ฝ่ายที่เบิกจ่าย' : 'ฝ่ายที่นำมาคืน'}</div>
-        <div class="depts">${S.depts.map(d => `<button class="dept" data-d="${esc(d.name)}" style="--c:${d.color}"><i class="fa-solid ${d.icon}"></i><span>${esc(d.name)}</span>${kind === 'return' ? `<em>ถืออยู่ ${fmt(S.dept.filter(r => r.department === d.name).reduce((a, r) => a + +r.qty, 0))} ตัว</em>` : ''}</button>`).join('')}</div></div>` : ''}
+        <div class="depts">${deptList.map(d => `<button class="dept" data-d="${esc(d.name)}" style="--c:${d.color}"><i class="fa-solid ${d.icon}"></i><span>${esc(d.name)}</span>${kind === 'return' ? `<em>ถืออยู่ ${fmt(S.dept.filter(r => r.department === d.name).reduce((a, r) => a + +r.qty, 0))} ตัว</em>` : ''}</button>`).join('')}</div></div>` : ''}
       <div class="step" id="stType"><div class="step-h"><span class="n">${cfg.dept ? 2 : 1}</span>เลือกประเภทพาเลท</div><div class="pick-types" id="ptypes"></div></div>
       <div class="step" id="stSize"><div class="step-h"><span class="n">${cfg.dept ? 3 : 2}</span>ขนาด (ม.)</div><div class="chips" id="psizes"><span class="hint">เลือกประเภทก่อน</span></div></div>
       <div class="step" id="stQty"><div class="step-h"><span class="n">${cfg.dept ? 4 : 3}</span>จำนวน (ตัว)</div>
@@ -792,6 +798,7 @@ function txForm(kind) {
     $('#psizes').innerHTML = sizes(t).map(s => `<button class="chip ${f.size === s ? 'sel' : ''}" data-s="${s}" style="--c:${t.color}"><i class="fa-solid fa-ruler-combined"></i>${s} ม.${kind !== 'receive' ? ` <small>(${fmt(avail(t.id, s))})</small>` : ''}</button>`).join('');
   };
   const maxQty = () => (f.type_id && f.size && kind !== 'receive') ? avail(f.type_id, f.size) : 9999;
+  let saving = false; // กำลังบันทึก: ปุ่มต้องปิดอยู่ (กันกดซ้ำ) แม้หน้าจอจะอัปเดตระหว่างรอ
   const refresh = () => {
     const t = typeById(f.type_id);
     $('#stType').classList.toggle('done', !!t);
@@ -814,7 +821,7 @@ function txForm(kind) {
     $('#sRows').innerHTML = rows.map(([a, b]) => `<div class="srow"><span>${a}</span><b>${b}</b></div>`).join('');
     const miss = [cfg.dept && !f.department && 'ฝ่าย', !t && 'ประเภท', !f.size && 'ขนาด'].filter(Boolean);
     const over = kind !== 'receive' && t && f.size && f.qty > maxQty();
-    $('#submit').disabled = miss.length > 0 || over || f.qty < 1;
+    $('#submit').disabled = saving || miss.length > 0 || over || f.qty < 1;
     $('#sHint').innerHTML = miss.length ? `<i class="fa-solid fa-hand-pointer fa-bounce"></i> กรุณาเลือก ${miss.join(', ')}` : over ? `<span style="color:var(--bad)"><i class="fa-solid fa-circle-exclamation fa-shake"></i> จำนวนเกินที่มีอยู่</span>` : '<i class="fa-solid fa-circle-check" style="color:var(--ok)"></i> พร้อมบันทึก';
   };
   const setQty = n => { f.qty = Math.max(1, Math.min(9999, n | 0)); $('#qty').value = f.qty; refresh(); };
@@ -833,12 +840,15 @@ function txForm(kind) {
     if (cEl) { f.condition = cEl.dataset.cond; $$('[data-cond]').forEach(x => x.classList.toggle('sel', x === cEl)); $('#causeBox').hidden = f.condition !== 'damaged'; }
     refresh();
   };
-  $('#qty').oninput = e => setQty(+e.target.value);
+  // ช่องว่างระหว่างพิมพ์ (ลบเลขเดิม): ยังไม่บังคับเป็น 1 — ไม่งั้นพิมพ์ 5 จะกลายเป็น 15
+  $('#qty').oninput = e => { if (e.target.value === '') { f.qty = 0; refresh(); } else setQty(+e.target.value); };
+  $('#qty').onchange = e => { if (e.target.value === '') setQty(1); };
   ['#fDate', '#fTime'].forEach(s => $(s).onchange = refresh);
 
   $('#submit').onclick = async () => {
     const btn = $('#submit');
-    btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> กำลังบันทึก...';
+    if (saving) return;
+    saving = true; btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> กำลังบันทึก...';
     try {
       const r = await writeApi(kind, { ...f, date: $('#fDate').value, time: $('#fTime').value, person: $('#fPerson').value, note: $('#fNote').value, cause: $('#fCause')?.value || '' });
       confetti();
@@ -858,6 +868,7 @@ function txForm(kind) {
       S.onModalClose = () => { if (location.hash.slice(1) === kind) route(); };
     } catch (e) {
       toast(e.message, 'err');
+      saving = false;
       btn.innerHTML = `<i class="fa-solid ${cfg.icon}"></i>${cfg.label}`;
       refresh();
     }
@@ -928,14 +939,17 @@ function repairAction(r, act) {
     </div>
     <p class="hint" style="font-size:12.5px;margin-top:10px"><i class="fa-solid fa-user-check" style="color:var(--ok)"></i> ผู้ทำรายการ: <b>${esc(meLabel())}</b> (ชื่อผู้ใช้งานมุมขวาบน)</p>
     <div class="modal-acts"><button class="btn btn-ghost" data-close>ยกเลิก</button><button class="btn ${meta[2]}" id="mGo"><i class="fa-solid ${meta[1]}"></i>${meta[0]}</button></div>`);
-  $('#mGo', m).onclick = async () => {
+  const go = $('#mGo', m);
+  go.onclick = async () => {
+    if (go.disabled) return;
+    go.disabled = true;
     try {
-      const res = await writeApi(act, { id: r.id, date: $('#mDate').value, time: $('#mTime').value, person: $('#mPerson').value, note: $('#mNote').value });
+      const res = await writeApi(act, { id: r.id, ticket_no: r.ticket_no, date: $('#mDate').value, time: $('#mTime').value, person: $('#mPerson').value, note: $('#mNote').value });
       closeModal();
       if (act === 'repair_done') confetti();
       toast(res.message);
       route();
-    } catch (e) { toast(e.message, 'err'); }
+    } catch (e) { toast(e.message, 'err'); go.disabled = false; }
   };
 }
 
@@ -1002,7 +1016,7 @@ async function history(initial) {
     </div>
     <div id="hRes"><div class="spinner"></div></div></div>`;
   const params = () => '&' + new URLSearchParams({ from: $('#hFrom').value, to: $('#hTo').value, type: $('#hType').value, act: $('#hAct').value, dept: $('#hDept').value, q: $('#hQ').value });
-  let items = [];
+  let items = [], loadSeq = 0;
   const show = () => {
     const tot = k => items.filter(i => i.action === k).reduce((a, i) => a + +i.qty, 0);
     $('#hRes').innerHTML = items.length ? `
@@ -1018,9 +1032,17 @@ async function history(initial) {
       </tbody></table></div>` : '<div class="empty"><i class="fa-solid fa-magnifying-glass"></i>ไม่พบรายการตามเงื่อนไข</div>';
   };
   const load = async () => {
-    $('#hRes').innerHTML = '<div class="spinner"></div>';
-    ({ items } = await api('history', null, params()));
-    show();
+    const seq = ++loadSeq, box = $('#hRes');
+    box.innerHTML = '<div class="spinner"></div>';
+    try {
+      const r = await api('history', null, params());
+      if (seq !== loadSeq || !box.isConnected) return; // ค้นหาใหม่ / เปลี่ยนหน้าไปแล้ว
+      items = r.items;
+      show();
+    } catch (e) {
+      if (seq !== loadSeq || !box.isConnected) return;
+      box.innerHTML = `<div class="empty"><i class="fa-solid fa-plug-circle-xmark"></i>${esc(e.message)}</div>`;
+    }
   };
   view.onclick = e => {
     const ed = e.target.closest('[data-medit]'), dl = e.target.closest('[data-mdel]');

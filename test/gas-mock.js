@@ -181,7 +181,23 @@ function createGas() {
       }
     },
     Logger: { log() {} },
-    console: { log() {}, error: console.error, warn: console.warn }
+    console: { log() {}, error: console.error, warn: console.warn },
+    // Project triggers (keep-warm). state.triggers: [{handler, everyMinutes, id}]
+    ScriptApp: {
+      getProjectTriggers() {
+        return (state.triggers || []).map(t => ({ getHandlerFunction: () => t.handler, getUniqueId: () => t.id, _t: t }));
+      },
+      deleteTrigger(tr) { state.triggers = (state.triggers || []).filter(t => t !== tr._t); },
+      newTrigger(handler) {
+        const t = { handler, id: "trg" + (++state.seq) };
+        const b = {
+          timeBased() { t.timeBased = true; return b; },
+          everyMinutes(n) { assert.ok([1, 5, 10, 15, 30].includes(n), "everyMinutes(" + n + ")"); t.everyMinutes = n; return b; },
+          create() { assert.ok(t.timeBased, "time-based"); (state.triggers = state.triggers || []).push(t); return { getUniqueId: () => t.id }; }
+        };
+        return b;
+      }
+    }
   };
   return { gas, state };
 }
@@ -1495,7 +1511,170 @@ test("login-version spreadsheet: extra username columns tolerated (empty for new
   err(L.P({ action: "login", username: "admin", password: "x" }), /^Unknown action$/);
 });
 
+/* ---------- keep-warm trigger ---------- */
+// A fresh, set-up instance (own spreadsheet / cache / triggers).
+function freshInstance() {
+  const g = createGas();
+  const c = loadCode(g.gas);
+  c.setupSystem();
+  g.state.props.PALLET_RESET_PASSWORD = RPW;
+  const G = (action, params = {}) => JSON.parse(c.doGet({ parameter: Object.assign({ action }, params) }).getContent());
+  const P = (payload, who = T.tester) => JSON.parse(c.doPost({ postData: { contents: JSON.stringify(Object.assign(who ? { actor: who } : {}, payload)) } }).getContent());
+  const ss = g.state.spreadsheets[g.state.props.PALLET_SPREADSHEET_ID];
+  const dump = () => JSON.stringify(ss.sheets.map(x => x.data));
+  const verOf = () => Object.fromEntries(Object.keys(g.state.cache).filter(k => /^PALLET_V_/.test(k)).map(k => [k, g.state.cache[k]]));
+  return { g, c, G, P, ss, dump, verOf, rows: n => ss.getSheetByName(n).data.slice(1) };
+}
+
+test("keepWarm: refreshes the read caches (live sheet reads, longer TTL) without writing rows or bumping versions", () => {
+  const F = freshInstance();
+  okData(F.P(Object.assign({ action: "receive", type_id: 1, size: "1.2x1.2", qty: 9 }, AT)));
+  okData(F.G("bootstrap")); // versions exist
+  const data = F.dump(), v0 = F.verOf(), locks = F.g.state.locks;
+  F.g.state.sheetReads = {}; F.g.state.cachePutAlls = []; F.g.state.events = [];
+  const r = F.c.keepWarm();
+  assert.strictEqual(r.warmed, true);
+  assert.strictEqual(F.dump(), data, "no sheet data written");
+  assert.deepStrictEqual(F.verOf(), v0, "no version bumped");
+  assert.ok(!F.g.state.events.some(e => /^write:|^flush$/.test(e)), F.g.state.events.join(","));
+  assert.strictEqual(F.g.state.locks, locks, "no script lock");
+  // every data sheet was read live (so hand edits are picked up and the TTL restarts) ...
+  for (const n of ["pallet_types", "departments", "repairs", "movements", "audit_logs"]) assert.strictEqual(F.g.state.sheetReads[n], 1, n);
+  // ... and stored with a TTL that outlives the 10-minute trigger period
+  assert.ok(F.g.state.cachePutAlls.length > 0 && F.g.state.cachePutAlls.every(t => t > 600), JSON.stringify(F.g.state.cachePutAlls));
+  // the page reads after a warm run come from the cache only
+  F.g.state.sheetReads = {};
+  frozenIn(F, () => {
+    okData(F.G("batch", { reads: JSON.stringify(["bootstrap", { action: "dashboard", days: "7" }, "repairs", "history"]) }));
+  });
+  assert.deepStrictEqual(F.g.state.sheetReads, {});
+  // and they equal live reads
+  const want = (() => { F.g.state.cacheDown = true; try { return okData(F.G("dashboard")); } finally { F.g.state.cacheDown = false; } })();
+  assert.deepStrictEqual(okData(F.G("dashboard")).stock, want.stock);
+  // a hand edit is visible after the next warm run (no clearReadCache needed)
+  const mv = F.ss.getSheetByName("movements");
+  mv.data[1][mv.data[0].indexOf("qty")] = 7;
+  F.c.keepWarm();
+  assert.strictEqual(okData(F.G("bootstrap")).stock[1]["1.2x1.2"].available, 7);
+});
+
+test("keepWarm: not set up / cache down -> returns an error object instead of throwing; nothing written", () => {
+  const g = createGas();
+  const c = loadCode(g.gas);
+  const r = c.keepWarm();
+  assert.strictEqual(r.warmed, false);
+  assert.ok(/setupSystem/.test(r.error));
+  const F = freshInstance();
+  const data = F.dump();
+  F.g.state.cacheDown = true;
+  try { assert.strictEqual(F.c.keepWarm().warmed, true); } finally { F.g.state.cacheDown = false; }
+  assert.strictEqual(F.dump(), data);
+});
+
+test("installKeepWarmTrigger: idempotent, one 10-minute trigger, other triggers untouched; removeKeepWarmTrigger", () => {
+  const F = freshInstance();
+  F.g.state.triggers = [{ handler: "somethingElse", id: "other", timeBased: true, everyMinutes: 30 }];
+  const a = F.c.installKeepWarmTrigger();
+  assert.strictEqual(a.installed, true);
+  F.c.installKeepWarmTrigger();
+  F.c.installKeepWarmTrigger();
+  const kw = F.g.state.triggers.filter(t => t.handler === "keepWarm");
+  assert.strictEqual(kw.length, 1);
+  assert.strictEqual(kw[0].everyMinutes, 10);
+  assert.ok(F.g.state.triggers.some(t => t.id === "other"));
+  // installing also warms the cache right away
+  F.g.state.sheetReads = {};
+  frozenIn(F, () => okData(F.G("bootstrap")));
+  assert.deepStrictEqual(F.g.state.sheetReads, {});
+  assert.strictEqual(F.c.removeKeepWarmTrigger().removed, 1);
+  assert.strictEqual(F.c.removeKeepWarmTrigger().removed, 0);
+  assert.deepStrictEqual(F.g.state.triggers.map(t => t.id), ["other"]);
+  // not reachable through the web app
+  err(F.G("keepWarm"), /^Unknown action$/);
+  err(F.P({ action: "keepWarm" }), /^Unknown action$/);
+  err(F.P({ action: "installKeepWarmTrigger" }), /^Unknown action$/);
+});
+function frozenIn(F, fn) {
+  const D = vm.runInContext("Date", F.c);
+  const real = D.now; const t = real(); D.now = () => t;
+  try { return fn(); } finally { D.now = real; }
+}
+
+/* ---------- bug fixes ---------- */
+test("repair steps cannot be dated before the previous step of their chain (chain would become uneditable)", () => {
+  const F = freshInstance();
+  okData(F.P({ action: "receive", type_id: 1, size: "1.2x1.2", qty: 10, date: "2026-03-01", time: "08:00" }));
+  okData(F.P({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 2, cause: "x", date: "2026-03-01", time: "10:00" }));
+  const t = okData(F.G("repairs")).items[0];
+  const n = F.rows("movements").length;
+  err(F.P({ action: "repair_start", id: t.id, date: "2026-03-01", time: "09:59" }), new RegExp("ก่อนขั้นตอนก่อนหน้าของงานซ่อม " + t.ticket_no + " \\(01/03/2026 10:00\\)"));
+  err(F.P({ action: "scrap", id: t.id, date: "2026-02-28", time: "23:00" }), /ก่อนขั้นตอนก่อนหน้า/);
+  assert.strictEqual(F.rows("movements").length, n);
+  assert.strictEqual(okData(F.G("repairs")).items[0].stage, "damaged");
+  okData(F.P({ action: "repair_start", id: t.id, date: "2026-03-01", time: "10:00" })); // same minute is fine
+  err(F.P({ action: "repair_done", id: t.id, date: "2026-03-01", time: "09:00" }), /ก่อนขั้นตอนก่อนหน้า/);
+  err(F.P({ action: "scrap", id: t.id, date: "2026-03-01", time: "09:30" }), /ก่อนขั้นตอนก่อนหน้า/);
+  okData(F.P({ action: "repair_done", id: t.id, date: "2026-03-02", time: "08:00" }));
+  // the chain stays editable (date edit of the done step within order works)
+  const done = okData(F.G("history", { act: "repair_done" })).items[0];
+  okData(F.P({ action: "movement_update", id: done.id, doc_no: done.doc_no, date: "2026-03-02", time: "09:00", resetPassword: RPW }));
+});
+
+test("repair actions check ticket_no when sent (a stale page never acts on a ticket that reused the id)", () => {
+  const F = freshInstance();
+  okData(F.P(Object.assign({ action: "receive", type_id: 1, size: "1.2x1.2", qty: 10 }, AT)));
+  okData(F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 1, cause: "a" }, AT)));
+  const a = okData(F.G("repairs")).items[0];
+  okData(F.P({ action: "repair_delete", id: a.id, ticket_no: a.ticket_no, resetPassword: RPW }));
+  okData(F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 3, cause: "b" }, AT)));
+  const b = okData(F.G("repairs")).items[0];
+  assert.strictEqual(b.id, a.id); // the id was handed out again
+  for (const act of ["repair_start", "scrap"]) {
+    err(F.P(Object.assign({ action: act, id: a.id, ticket_no: a.ticket_no }, AT)), /ไม่พบใบแจ้งซ่อมนี้ \(อาจถูกลบไปแล้ว\)/);
+  }
+  assert.strictEqual(okData(F.G("repairs")).items[0].stage, "damaged");
+  okData(F.P(Object.assign({ action: "repair_start", id: b.id, ticket_no: b.ticket_no }, AT)));
+  err(F.P(Object.assign({ action: "repair_done", id: a.id, ticket_no: a.ticket_no }, AT)), /ไม่พบใบแจ้งซ่อมนี้/);
+  okData(F.P(Object.assign({ action: "repair_done", id: b.id, ticket_no: b.ticket_no }, AT)));
+  err(F.P(Object.assign({ action: "repair_start", id: 999 }, AT)), /^ไม่พบใบแจ้งซ่อม$/); // without ticket_no: as before
+});
+
+test("a new repair ticket's note is limited like ticket edits (1000 characters)", () => {
+  const F = freshInstance();
+  okData(F.P(Object.assign({ action: "receive", type_id: 1, size: "1.2x1.2", qty: 10 }, AT)));
+  const n = F.rows("repairs").length;
+  err(F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 1, cause: "a", note: "x".repeat(1001) }, AT)), /หมายเหตุยาวเกิน 1000/);
+  okData(F.P(Object.assign({ action: "issue", type_id: 1, size: "1.2x1.2", qty: 2, department: "ฝ่ายผลิต" }, AT)));
+  err(F.P(Object.assign({ action: "return", type_id: 1, size: "1.2x1.2", qty: 1, department: "ฝ่ายผลิต", condition: "damaged", cause: "a", note: "x".repeat(1001) }, AT)), /หมายเหตุยาวเกิน 1000/);
+  assert.strictEqual(F.rows("repairs").length, n);
+  okData(F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 1, cause: "a", note: "  " + "x".repeat(1000) + "  " }, AT)));
+});
+
 /* ---------- frontend ---------- */
+// Regression checks for frontend fixes (behaviour verified in a browser against test/pallet-dev.js).
+test("frontend fixes: no double submit, qty field, deleted departments on return, history errors, repaint rules", () => {
+  const app = fs.readFileSync(path.join(ROOT, "docs/assets/app.js"), "utf8");
+  const fnSrc = name => { const i = app.indexOf("function " + name + "("); assert.ok(i !== -1, name); return app.slice(i, app.indexOf("\nfunction ", i + 10)); };
+  const tx = fnSrc("txForm");
+  // the bubbling view.onclick -> refresh() used to re-enable the submit button right after it was disabled
+  assert.ok(/\$\('#submit'\)\.disabled = saving \|\|/.test(tx), "refresh keeps the button disabled while saving");
+  assert.ok(/if \(saving\) return;\s*saving = true;/.test(tx), "submit ignores clicks while saving");
+  assert.ok(/catch \(e\) \{\s*toast\(e\.message, 'err'\);\s*saving = false;/.test(tx), "an error re-enables saving");
+  // emptied qty field is not forced back to "1" while typing
+  assert.ok(/\$\('#qty'\)\.oninput = e => \{ if \(e\.target\.value === ''\)/.test(tx));
+  // return form: departments still holding pallets are listed even after they were deleted
+  assert.ok(/deptList = kind === 'return'[\s\S]*S\.dept\.map\(r => r\.department\)/.test(tx) && tx.includes("${deptList.map(d =>"));
+  // repair step buttons: one request per click, ticket_no sent with the id
+  const ra = fnSrc("repairAction");
+  assert.ok(/if \(go\.disabled\) return;\s*go\.disabled = true;/.test(ra) && /ticket_no: r\.ticket_no/.test(ra) && /go\.disabled = false/.test(ra));
+  // history search: errors are shown, stale answers dropped
+  const hi = fnSrc("history");
+  assert.ok(/try \{\s*const r = await api\('history'/.test(hi) && /catch \(e\) \{[\s\S]*box\.innerHTML = `<div class="empty">/.test(hi) && /seq !== loadSeq/.test(hi));
+  // background refresh only keeps a stale screen on pages with user input
+  assert.ok(/S\.dirty && INPUT_PAGES\.includes\(p\)/.test(app));
+  assert.ok(/INPUT_PAGES = \['receive', 'issue', 'return', 'damage', 'history', 'settings'\]/.test(app));
+});
+
 test("docs JS files parse (new Function); no login UI; reset password never stored; cache-buster", () => {
   for (const f of ["docs/config.js", "docs/assets/app.js"]) {
     const src = fs.readFileSync(path.join(ROOT, f), "utf8");
@@ -1519,7 +1698,7 @@ test("docs JS files parse (new Function); no login UI; reset password never stor
   assert.ok(!/palletRC[^\n]*logs/.test(app));
   assert.ok(app.includes("ผู้ทำรายการ / By"));
   const html = fs.readFileSync(path.join(ROOT, "docs/index.html"), "utf8");
-  assert.ok(html.includes('assets/app.js?v=20"'));
+  assert.ok(html.includes('assets/app.js?v=21"'));
   assert.ok(!html.includes('id="loginScreen"') && !html.includes('data-page="account"') && !html.includes("umLogout"));
   assert.ok(html.includes('id="userChip"') && html.includes('data-page="logs"'));
   assert.ok(/<link rel="preconnect" href="https:\/\/script\.google\.com"/.test(html) && /script\.googleusercontent\.com/.test(html));

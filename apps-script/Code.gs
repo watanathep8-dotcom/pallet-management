@@ -25,6 +25,9 @@
  * "updated_username") are left empty for new rows, and a "users" sheet is
  * simply ignored (never read, changed or deleted).
  *
+ * Optional: run installKeepWarmTrigger() once from the editor; a 10-minute
+ * trigger then runs keepWarm() (read-only) to keep the read cache hot.
+ *
  * Transport:
  *   GET  ?action=<read action>&...params -> {ok:true,data} | {ok:false,error}
  *   POST text/plain JSON {action, actor, ...fields}
@@ -149,6 +152,8 @@ var VERSION_PREFIX = "PALLET_V_";
 var VERSION_TTL = 21600;
 var RC_PREFIX = "PALLET_RC_";
 var READ_CACHE_TTL = 600;
+var KEEP_WARM_TTL = 900;   // keepWarm stores for longer than its 10-minute period (no gaps)
+var KEEP_WARM_MINUTES = 10;
 var RC_CHUNK = 30000;      // characters per cache value (<= 100 KB even for 3-byte UTF-8 text)
 var RC_MAX_CHUNKS = 30;    // bigger sheets are simply not cached
 var WRITE_ACTIONS = ["receive", "issue", "return", "damage", "repair_start", "repair_done", "scrap", "dept_save", "dept_delete"];
@@ -646,9 +651,10 @@ function actionDamage_(input) {
 }
 
 function actionRepairStart_(input) {
-  var rp = getRepair_(phpInt_(input.id));
+  var rp = repairIn_(input);
   if (rp.stage !== "damaged") fail_("ใบนี้ไม่ได้อยู่สถานะชำรุด");
   var at = moment_(input);
+  assertAfterChain_(rp, at);
   var person = textIn_(input, "person", MAX_PERSON, "ชื่อผู้ทำรายการ");
   update_("repairs", rp, stampTicket_({ stage: "repairing", started_at: at, repairer: phpTruthy_(person) ? person : actorName_() }));
   var r = move_("repair_start", rp.type_id, rp.size, rp.qty, "damaged", "repairing",
@@ -658,9 +664,10 @@ function actionRepairStart_(input) {
 }
 
 function actionRepairDone_(input) {
-  var rp = getRepair_(phpInt_(input.id));
+  var rp = repairIn_(input);
   if (rp.stage !== "repairing") fail_("ใบนี้ไม่ได้อยู่ระหว่างซ่อม");
   var at = moment_(input);
+  assertAfterChain_(rp, at);
   var rawNote = safeStr_(input.note);
   if (mbLen_(rawNote) > MAX_REPAIR_NOTE) fail_("หมายเหตุยาวเกิน " + MAX_REPAIR_NOTE + " ตัวอักษร");
   var person = textIn_(input, "person", MAX_PERSON, "ชื่อผู้ทำรายการ");
@@ -676,9 +683,10 @@ function actionRepairDone_(input) {
 }
 
 function actionScrap_(input) {
-  var rp = getRepair_(phpInt_(input.id));
+  var rp = repairIn_(input);
   if (rp.stage !== "damaged" && rp.stage !== "repairing") fail_("ไม่สามารถตัดจำหน่ายใบนี้ได้");
   var at = moment_(input);
+  assertAfterChain_(rp, at);
   var person = textIn_(input, "person", MAX_PERSON, "ชื่อผู้ทำรายการ");
   var note = textIn_(input, "note", MAX_TEXT, "หมายเหตุ");
   var fromStage = rp.stage;
@@ -1158,6 +1166,27 @@ function getRepair_(id) {
   fail_("ไม่พบใบแจ้งซ่อม");
 }
 
+// Ticket for repair_start / repair_done / scrap. When the page sends the
+// ticket_no it must match: ids can be handed out again after a delete, so a
+// page showing an old (deleted) ticket never acts on another ticket.
+function repairIn_(input) {
+  if (!phpEmpty_(input.ticket_no)) return findTicket_(input);
+  return getRepair_(phpInt_(input.id));
+}
+
+// A repair step (repair_start / repair_done / scrap) may not be dated before
+// the latest step already recorded for the ticket: the chain must stay in
+// order (see CHAIN_SEQUENCES), else it could never be edited again.
+function assertAfterChain_(rp, at) {
+  var last = rp.started_at != null && rp.started_at > rp.reported_at ? rp.started_at : rp.reported_at;
+  table_("movements").rows.forEach(function (m) {
+    if (m.repair_id === rp.id && m.moved_at > last) last = m.moved_at;
+  });
+  if (last && at < last) {
+    fail_("วันที่/เวลาต้องไม่ก่อนขั้นตอนก่อนหน้าของงานซ่อม " + rp.ticket_no + " (" + dtTh_(last) + ")");
+  }
+}
+
 function baseInput_(input) {
   var type = phpInt_(input.type_id);
   var t = getType_(type);
@@ -1231,7 +1260,7 @@ function createTicket_(type, size, qty, source, dept, input, at) {
     ticket_no: nextNo_("RPR", "repairs", "ticket_no"),
     type_id: type, size: size, qty: qty, stage: "damaged", source: source,
     department: dept, cause: phpTrim_(safeStr_(input.cause)), reported_by: REQ_.actor, reported_username: REQ_.username,
-    repairer: "", reported_at: at, started_at: null, finished_at: null, note: phpTrim_(safeStr_(input.note)),
+    repairer: "", reported_at: at, started_at: null, finished_at: null, note: textIn_(input, "note", MAX_REPAIR_NOTE, "หมายเหตุ"),
     updated_by: "", updated_username: "", updated_at: null
   });
   return row.id;
@@ -1278,6 +1307,7 @@ function resetRequest_(actor) {
     ss: null, tables: {}, appends: {}, updates: [], deletes: [], actor: actor || "", username: "",
     dirty: {},          // sheets changed outside the buffers (reset_data) -> version bump on flush
     cacheReads: false,  // true only while answering read actions
+    refreshCache: false, // keepWarm: read the sheets live and store them again (fresh TTL)
     vers: null          // data versions read for this request (see versions_)
   };
 }
@@ -1301,7 +1331,7 @@ function table_(name) {
   var ver = null;
   if (cacheable) {
     ver = versions_()[name] || null; // taken BEFORE the sheet is read
-    var hit = ver ? cachedRows_(name, ver) : null;
+    var hit = ver && !REQ_.refreshCache ? cachedRows_(name, ver) : null;
     if (hit) return (REQ_.tables[name] = hit);
   }
   var sheet = db_().getSheetByName(name);
@@ -1386,6 +1416,7 @@ function bumpVersions_(names) {
 // Stores text under key in chunks of RC_CHUNK characters: key holds "<n>|<chunk 0>",
 // key_1..key_<n-1> the rest. Too big (> RC_MAX_CHUNKS) or cache errors: not stored.
 function rcPut_(key, text) {
+  var ttl = REQ_ && REQ_.refreshCache ? KEEP_WARM_TTL : READ_CACHE_TTL;
   var n = Math.max(1, Math.ceil(text.length / RC_CHUNK));
   if (n > RC_MAX_CHUNKS) return;
   var map = {};
@@ -1393,7 +1424,7 @@ function rcPut_(key, text) {
     var part = text.substr(i * RC_CHUNK, RC_CHUNK);
     map[i ? key + "_" + i : key] = i ? part : n + "|" + part;
   }
-  try { cache_().putAll(map, READ_CACHE_TTL); } catch (ignored) {}
+  try { cache_().putAll(map, ttl); } catch (ignored) {}
 }
 
 function rcGet_(key) {
@@ -1457,7 +1488,7 @@ function cachedDerived_(id, deps, fn) {
     parts.push(vers[deps[i]]);
   }
   var key = RC_PREFIX + id + "_" + parts.join("_");
-  var text = rcGet_(key);
+  var text = REQ_.refreshCache ? null : rcGet_(key);
   if (text) {
     try { return JSON.parse(text); } catch (ignored) {}
   }
@@ -1473,6 +1504,52 @@ function cachedDerived_(id, deps, fn) {
 function clearReadCache() {
   bumpVersions_(CACHED_TABLES);
   return { cleared: CACHED_TABLES };
+}
+
+/* ---------- keep-warm (time-driven trigger) ----------
+ * keepWarm() runs the reads the pages open with (bootstrap, dashboard,
+ * repairs) the way a web request would, but reads every sheet live and stores
+ * it again in the read cache under the CURRENT data versions with a TTL longer
+ * than the trigger period, so the next web request is answered from
+ * CacheService. It only reads: no sheet row is written, no version is bumped,
+ * no lock is taken (a missing version is created exactly as by any read).
+ * Hand edits in the spreadsheet are picked up at each run.
+ * Run installKeepWarmTrigger() once from the Apps Script editor.
+ */
+function keepWarm() {
+  try {
+    resetRequest_("");
+    REQ_.cacheReads = true;
+    REQ_.refreshCache = true;
+    handleRead_("bootstrap", {});
+    handleRead_("dashboard", {});
+    handleRead_("repairs", {});
+    return { warmed: true };
+  } catch (error) {
+    console.log("keepWarm: " + errorMessage_(error));
+    return { warmed: false, error: errorMessage_(error) };
+  } finally {
+    REQ_ = null;
+  }
+}
+
+/** Run once from the editor: (re)creates the one keepWarm trigger (every 10 minutes). */
+function installKeepWarmTrigger() {
+  removeKeepWarmTrigger();
+  ScriptApp.newTrigger("keepWarm").timeBased().everyMinutes(KEEP_WARM_MINUTES).create();
+  var warm = keepWarm();
+  var result = { installed: true, everyMinutes: KEEP_WARM_MINUTES, warmed: warm.warmed };
+  console.log(JSON.stringify(result));
+  return result;
+}
+
+/** Deletes every keepWarm trigger of this project (other triggers are left alone). */
+function removeKeepWarmTrigger() {
+  var removed = 0;
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === "keepWarm") { ScriptApp.deleteTrigger(t); removed++; }
+  });
+  return { removed: removed };
 }
 
 function insert_(name, obj) {
