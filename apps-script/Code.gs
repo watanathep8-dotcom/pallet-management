@@ -31,8 +31,8 @@
  * Optional Microsoft Teams notifications: set Script Property
  * TEAMS_WEBHOOK_URL to the URL of a Teams Workflow "Post to a channel when a
  * webhook request is received" (the URL lives only there, never in source).
- * After a successful damage report, repair_done, scrap, record edit/delete or
- * reset_data, one Adaptive Card is posted - after the lock is released, and a
+ * After every successful return (good or damaged) and every damage report
+ * from stock, one Adaptive Card is posted - after the lock is released, and a
  * failure never changes the API response or the saved data. Unset = no
  * notifications. Run testTeamsNotification() from the editor to check it.
  *
@@ -70,7 +70,6 @@ var TEAMS_WEBHOOK_PROPERTY = "TEAMS_WEBHOOK_URL";
 var SITE_URL_PROPERTY = "PALLET_SITE_URL";
 var DEFAULT_SITE_URL = "https://watanathep8-dotcom.github.io/pallet-management/";
 var TEAMS_MAX_FACT = 300;    // characters per card fact value
-var TEAMS_MAX_DETAIL = 1500; // characters of the before -> after text
 
 // Asia/Bangkok has no daylight saving time, so a fixed +07:00 offset gives the
 // same wall-clock values as PHP's date_default_timezone_set('Asia/Bangkok').
@@ -649,12 +648,15 @@ function actionReturn_(input) {
     var tk = createTicket_(b.type, b.size, b.qty, "issued", dept, input, at);
     r = move_("damage", b.type, b.size, b.qty, "issued", "damaged",
       { department: dept, person: person, note: "คืนสภาพชำรุด: " + cause, repair_id: tk.id, moved_at: at });
-    teamsNotice_({ kind: "damage", ticket: tk, type: b.t, doc_no: r.doc_no, at: at });
+    teamsNotice_({ kind: "return", type: b.t, size: b.size, qty: b.qty, department: dept, damaged: true, ticket: tk,
+      doc_no: r.doc_no, person: person, note: tk.note, at: at });
     msg = "รับคืนชำรุด " + b.qty + " ตัว — เปิดใบแจ้งซ่อมแล้ว";
   } else {
     var note = textIn_(input, "note", MAX_TEXT, "หมายเหตุ");
     r = move_("return", b.type, b.size, b.qty, "issued", "available",
       { department: dept, person: person, note: note, moved_at: at });
+    teamsNotice_({ kind: "return", type: b.t, size: b.size, qty: b.qty, department: dept, damaged: false,
+      doc_no: r.doc_no, person: person, note: note, at: at });
     msg = "รับคืนจาก " + dept + " " + b.qty + " ตัว เรียบร้อย";
   }
   r.message = msg;
@@ -671,7 +673,7 @@ function actionDamage_(input) {
   var tk = createTicket_(b.type, b.size, b.qty, "available", null, input, at);
   var r = move_("damage", b.type, b.size, b.qty, "available", "damaged",
     { person: person, note: cause, repair_id: tk.id, moved_at: at });
-  teamsNotice_({ kind: "damage", ticket: tk, type: b.t, doc_no: r.doc_no, at: at });
+  teamsNotice_({ kind: "damage", ticket: tk, type: b.t, doc_no: r.doc_no, person: person, at: at });
   r.message = "แจ้งชำรุด " + b.qty + " ตัว เรียบร้อย";
   return r;
 }
@@ -704,7 +706,6 @@ function actionRepairDone_(input) {
   }));
   var r = move_("repair_done", rp.type_id, rp.size, rp.qty, "repairing", "available",
     { person: phpTruthy_(person) ? person : rp.repairer, note: rp.ticket_no, repair_id: rp.id, moved_at: at });
-  teamsNotice_({ kind: "repair_done", ticket: rp, type: getType_(rp.type_id), doc_no: r.doc_no, at: at, note: phpTrim_(rawNote) });
   r.message = "ซ่อมเสร็จ " + rp.qty + " ตัว กลับเข้าคลังพร้อมใช้";
   return r;
 }
@@ -720,7 +721,6 @@ function actionScrap_(input) {
   update_("repairs", rp, stampTicket_({ stage: "scrapped", finished_at: at }));
   var r = move_("scrap", rp.type_id, rp.size, rp.qty, fromStage, "scrapped",
     { person: person, note: rp.ticket_no + " " + note, repair_id: rp.id, moved_at: at });
-  teamsNotice_({ kind: "scrap", ticket: rp, type: getType_(rp.type_id), doc_no: r.doc_no, at: at, note: note, from: fromStage });
   r.message = "ตัดจำหน่าย " + rp.qty + " ตัว แล้ว";
   return r;
 }
@@ -779,7 +779,6 @@ function actionResetData_() {
   var detail = "รีเซ็ตข้อมูล: ล้างชีต movements (" + removed.movements + " แถว), repairs (" + removed.repairs +
     " แถว), audit_logs (" + removed.audit_logs + " แถว) · คงไว้: pallet_types, departments";
   audit_("setting", "รีเซ็ตข้อมูล", detail);
-  teamsNotice_({ kind: "record", detail: detail, ref: "", page: "" });
   return {
     removed: removed,
     message: "รีเซ็ตข้อมูลแล้ว — ลบประวัติเคลื่อนไหว " + removed.movements + " แถว, งานซ่อม " +
@@ -901,13 +900,12 @@ function actionMovementUpdate_(input) {
   var detail = "แก้ไขรายการ " + m.doc_no + " (" + ACT_NAME[m.action] + " " + str_(t.code) + " ขนาด " + m.size + "): " +
     parts.join("; ") + chainNote;
   audit_("pallet", "แก้ไขรายการ", detail, m.doc_no);
-  teamsNotice_({ kind: "record", detail: detail, ref: m.doc_no, page: "history" });
   return { changed: true, message: "แก้ไขรายการ " + m.doc_no + " แล้ว" };
 }
 
 function actionMovementDelete_(input) {
   var m = findMovement_(input);
-  if (m.repair_id != null) return deleteChain_(m.repair_id, "history");
+  if (m.repair_id != null) return deleteChain_(m.repair_id);
 
   var moves = table_("movements").rows;
   var proposed = moves.filter(function (r) { return r.id !== m.id; });
@@ -915,12 +913,11 @@ function actionMovementDelete_(input) {
   var detail = "ลบรายการ " + m.doc_no + ": " + describeMove_(m);
   delete_("movements", m);
   audit_("pallet", "ลบรายการ", detail, m.doc_no);
-  teamsNotice_({ kind: "record", detail: detail, ref: m.doc_no, page: "history" });
   return { removed: { movements: 1, repairs: 0 }, message: "ลบรายการ " + m.doc_no + " แล้ว" };
 }
 
 function actionRepairDelete_(input) {
-  return deleteChain_(findTicket_(input).id, "repair");
+  return deleteChain_(findTicket_(input).id);
 }
 
 function actionRepairUpdate_(input) {
@@ -953,13 +950,11 @@ function actionRepairUpdate_(input) {
   update_("repairs", rp, stampTicket_(ch));
   var detail = "แก้ไขใบแจ้งซ่อม " + rp.ticket_no + ": " + parts.join("; ");
   audit_("repair", "แก้ไขใบแจ้งซ่อม", detail, rp.ticket_no);
-  teamsNotice_({ kind: "record", detail: detail, ref: rp.ticket_no, page: "repair" });
   return { changed: true, message: "แก้ไขใบแจ้งซ่อม " + rp.ticket_no + " แล้ว" };
 }
 
 // Deletes a repair ticket and every movement linked to it as one unit.
-// page: the site page the Teams card links to.
-function deleteChain_(rid, page) {
+function deleteChain_(rid) {
   var moves = table_("movements").rows;
   var chain = sortBy_(moves.filter(function (r) { return r.repair_id === rid; }), byMovedAsc_);
   var ticket = null;
@@ -977,7 +972,6 @@ function deleteChain_(rid, page) {
   var detail = "ลบรายการทั้งชุดงานซ่อม " + tno + " (" + str_(t.code) + " ขนาด " + str_((ticket || chain[0] || {}).size) + "): " +
     (ticket ? "ใบแจ้งซ่อม + " : "") + chain.length + " รายการ — " + list.join(", ");
   audit_("pallet", "ลบรายการ", detail, tno);
-  teamsNotice_({ kind: "record", detail: detail, ref: tno, page: page });
   return {
     removed: { movements: chain.length, repairs: ticket ? 1 : 0 },
     message: "ลบงานซ่อม " + tno + " ทั้งชุดแล้ว (ใบแจ้งซ่อม + " + chain.length + " รายการเคลื่อนไหว)"
@@ -1425,43 +1419,40 @@ function teamsCard_(n) {
     var v = teamsText_(value, TEAMS_MAX_FACT);
     if (v !== "") facts.push({ title: title, value: v });
   };
-  var title, page, detail = "";
-  var ticketFacts = function () {
+  var title, page;
+  var who = function () {
+    fact("ชื่อที่ระบุ", n.person);
+    fact("ผู้ทำรายการ", n.actor || "-");
+    if (n.at) fact("วันที่/เวลา", dtTh_(n.at) + " น.");
+  };
+  if (n.kind === "return") { // รับคืน (good or damaged; one card either way)
+    title = (n.damaged ? "รับคืน (ชำรุด) " : "รับคืน ") + str_(n.doc_no);
+    page = "history";
+    fact("เลขที่เอกสาร", n.doc_no);
+    fact("ประเภทพาเลท", teamsType_(n.type));
+    fact("ขนาด", n.size ? n.size + " ม." : "");
+    fact("จำนวน", n.qty + " ตัว");
+    fact("รับคืนจากฝ่าย", n.department);
+    fact("สถานะหลังรับคืน", n.damaged ? "ชำรุด — เปิดใบแจ้งซ่อม " + str_(tk.ticket_no) : "พร้อมใช้");
+    if (n.damaged) fact("สาเหตุ", tk.cause || "-");
+    fact("หมายเหตุ", n.note);
+    who();
+  } else if (n.kind === "damage") { // แจ้งชำรุด from stock
+    title = "แจ้งชำรุด " + str_(tk.ticket_no);
+    page = "repair";
     fact("เลขที่ใบแจ้งซ่อม", tk.ticket_no);
     fact("ประเภทพาเลท", teamsType_(n.type));
     fact("ขนาด", tk.size ? tk.size + " ม." : "");
     fact("จำนวน", tk.qty + " ตัว");
-  };
-  if (n.kind === "damage") {
-    title = "แจ้งชำรุด " + str_(tk.ticket_no);
-    page = "repair";
-    ticketFacts();
-    fact("ที่มา", tk.source === "issued" ? "รับคืนจาก " + str_(tk.department) : "จากคลัง (พร้อมใช้)");
     fact("สาเหตุ", tk.cause || "-");
-  } else if (n.kind === "repair_done") {
-    title = "ซ่อมเสร็จ " + str_(tk.ticket_no);
-    page = "repair";
-    ticketFacts();
-    fact("ช่างผู้ซ่อม", tk.repairer);
-    fact("หมายเหตุ", n.note);
-  } else if (n.kind === "scrap") {
-    title = "ซ่อมไม่ได้ / ตัดจำหน่าย " + str_(tk.ticket_no);
-    page = "repair";
-    ticketFacts();
-    fact("จากสถานะ", STATUS_NAME[n.from] || n.from);
-    fact("หมายเหตุ", n.note);
-  } else if (n.kind === "record") {
-    title = (n.action === RESET_ACTION ? "รีเซ็ตข้อมูล" : (RECORD_ACT_NAME[n.action] || "แก้ไขข้อมูล")) + (n.ref ? " " + n.ref : "");
-    page = n.page || "";
-    detail = teamsText_(n.detail, TEAMS_MAX_DETAIL);
+    fact("เลขที่เอกสาร", n.doc_no);
+    who();
   } else { // "test" (testTeamsNotification)
     title = "ทดสอบการแจ้งเตือน";
     page = "";
     fact("ข้อความ", "ถ้าเห็นการ์ดนี้ แสดงว่าการแจ้งเตือน Teams ของ Pallet Hub ใช้งานได้");
+    who();
   }
-  if (n.doc_no) fact("เลขที่เอกสาร", n.doc_no);
-  if (n.at) fact("วันที่/เวลา", dtTh_(n.at) + " น.");
-  fact("ผู้ทำรายการ", n.actor || "-");
 
   var body = [
     { type: "TextBlock", text: "PALLET HUB", size: "Small", weight: "Bolder", color: "Attention", spacing: "None" },
@@ -1469,7 +1460,6 @@ function teamsCard_(n) {
     { type: "TextBlock", text: "แจ้งเมื่อ " + dtTh_(nowParts_().datetime) + " น. (เวลาไทย)", size: "Small", isSubtle: true, wrap: true, spacing: "None" }
   ];
   if (facts.length) body.push({ type: "FactSet", facts: facts, separator: true });
-  if (detail) body.push({ type: "TextBlock", text: detail, wrap: true, separator: true });
 
   return {
     type: "message",

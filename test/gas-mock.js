@@ -1672,7 +1672,6 @@ const HOOK = "https://prod-00.southeastasia.logic.azure.com:443/workflows/0a1b2c
 const SITE = "https://watanathep8-dotcom.github.io/pallet-management/";
 const card = f => JSON.parse(f.opts.payload);
 const factsOf = p => Object.fromEntries(p.attachments[0].content.body.find(b => b.type === "FactSet").facts.map(x => [x.title, x.value]));
-const detailOf = p => { const b = p.attachments[0].content.body; return b.length > 4 ? b[4].text : null; };
 const titleOf = p => p.attachments[0].content.body[1].text;
 const linkOf = p => p.attachments[0].content.actions[0].url;
 const DTH = `${TODAY.slice(8, 10)}/${TODAY.slice(5, 7)}/${TODAY.slice(0, 4)} ${HOUR}:00 น.`;
@@ -1699,32 +1698,24 @@ test("Teams: TEAMS_WEBHOOK_URL unset or blank -> no fetch for any event, writes 
     const F = teamsInstance(hook);
     const f = F.sent(() => {
       okData(F.P(Object.assign({ action: "receive", type_id: 1, size: "1.2x1.2", qty: 10 }, AT)));
+      okData(F.P(Object.assign({ action: "issue", type_id: 1, size: "1.2x1.2", qty: 4, department: "ฝ่ายผลิต" }, AT)));
+      okData(F.P(Object.assign({ action: "return", type_id: 1, size: "1.2x1.2", qty: 1, department: "ฝ่ายผลิต", condition: "good" }, AT)));
+      okData(F.P(Object.assign({ action: "return", type_id: 1, size: "1.2x1.2", qty: 1, department: "ฝ่ายผลิต", condition: "damaged", cause: "y" }, AT)));
       okData(F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 2, cause: "x" }, AT)));
-      const t = okData(F.G("repairs")).items[0];
-      okData(F.P(Object.assign({ action: "repair_start", id: t.id }, AT)));
-      okData(F.P(Object.assign({ action: "repair_done", id: t.id }, AT)));
-      const m = okData(F.G("history", { act: "receive" })).items[0];
-      okData(F.R("movement_update", { id: m.id, note: "n" }));
-      okData(F.R("reset_data"));
     });
     assert.strictEqual(f.length, 0, "hook " + JSON.stringify(hook));
+    assert.strictEqual(okData(F.G("repairs")).items.length, 2);
     assert.ok(!F.g.state.logs.some(l => /Teams/.test(l[1])), "silently skipped");
   }
 });
 
-test("Teams: damage (from stock / returned damaged) -> one Adaptive Card each with ticket, type, size, qty, source, cause, who", () => {
+test("Teams: return (good / damaged) -> exactly one card each: doc no, type/size, qty, department, resulting status (+ ticket), note, who, when", () => {
   const F = teamsInstance();
-  // ordinary receive / issue / return / repair_start / dept settings: no notification
-  const quiet = F.sent(() => {
-    okData(F.P(Object.assign({ action: "receive", type_id: 1, size: "1.2x1.2", qty: 20 }, AT)));
-    okData(F.P(Object.assign({ action: "issue", type_id: 1, size: "1.2x1.2", qty: 5, department: "ฝ่ายผลิต" }, AT)));
-    okData(F.P(Object.assign({ action: "return", type_id: 1, size: "1.2x1.2", qty: 1, department: "ฝ่ายผลิต", condition: "good" }, AT)));
-    okData(F.P({ action: "dept_save", name: "ฝ่ายใหม่", resetPassword: RPW }));
-  });
-  assert.strictEqual(quiet.length, 0);
+  okData(F.P(Object.assign({ action: "receive", type_id: 1, size: "1.2x1.2", qty: 20 }, AT)));
+  okData(F.P(Object.assign({ action: "issue", type_id: 1, size: "1.2x1.2", qty: 5, department: "ฝ่ายผลิต" }, AT)));
 
   let d;
-  const f = F.sent(() => { d = okData(F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 2, cause: "ไม้หัก", person: "C" }, AT), "สมชาย")); });
+  const f = F.sent(() => { d = okData(F.P(Object.assign({ action: "return", type_id: 1, size: "1.2x1.2", qty: 2, department: "ฝ่ายผลิต", condition: "good", person: "C", note: "คืนหลังกะ\nดึก" }, AT), "สมชาย")); });
   assert.strictEqual(f.length, 1);
   assert.strictEqual(f[0].url, HOOK);
   assert.deepStrictEqual(Object.assign({}, f[0].opts, { payload: undefined }), { method: "post", contentType: "application/json", payload: undefined, muteHttpExceptions: true });
@@ -1739,93 +1730,82 @@ test("Teams: damage (from stock / returned damaged) -> one Adaptive Card each wi
   assert.strictEqual(a.content.type, "AdaptiveCard");
   assert.strictEqual(a.content.version, "1.4");
   assert.strictEqual(a.content.body[1].color, "Attention");
+  assert.strictEqual(a.content.body.length, 4);
   assert.ok(/^แจ้งเมื่อ \d\d\/\d\d\/\d{4} \d\d:\d\d น\. \(เวลาไทย\)$/.test(a.content.body[2].text), a.content.body[2].text);
-  assert.deepStrictEqual(a.content.actions, [{ type: "Action.OpenUrl", title: "เปิด Pallet Hub", url: SITE + "#repair" }]);
-  const t = okData(F.G("repairs")).items[0];
-  assert.strictEqual(titleOf(p), "แจ้งชำรุด " + t.ticket_no);
+  assert.deepStrictEqual(a.content.actions, [{ type: "Action.OpenUrl", title: "เปิด Pallet Hub", url: SITE + "#history" }]);
+  assert.strictEqual(titleOf(p), "รับคืน " + d.doc_no);
   assert.deepStrictEqual(factsOf(p), {
-    "เลขที่ใบแจ้งซ่อม": t.ticket_no, "ประเภทพาเลท": "RM — พาเลทสำหรับใส่ RM", "ขนาด": "1.2x1.2 ม.", "จำนวน": "2 ตัว",
-    "ที่มา": "จากคลัง (พร้อมใช้)", "สาเหตุ": "ไม้หัก", "เลขที่เอกสาร": d.doc_no, "วันที่/เวลา": DTH, "ผู้ทำรายการ": "สมชาย"
+    "เลขที่เอกสาร": d.doc_no, "ประเภทพาเลท": "RM — พาเลทสำหรับใส่ RM", "ขนาด": "1.2x1.2 ม.", "จำนวน": "2 ตัว",
+    "รับคืนจากฝ่าย": "ฝ่ายผลิต", "สถานะหลังรับคืน": "พร้อมใช้", "หมายเหตุ": "คืนหลังกะ ดึก",
+    "ชื่อที่ระบุ": "C", "ผู้ทำรายการ": "สมชาย", "วันที่/เวลา": DTH
   });
-  // returned damaged from a department
-  const p2 = F.one(() => okData(F.P(Object.assign({ action: "return", type_id: 1, size: "1.2x1.2", qty: 1, department: "ฝ่ายผลิต", condition: "damaged", cause: "ตะปูหลุด" }, AT))));
-  const f2 = factsOf(p2);
-  assert.strictEqual(f2["ที่มา"], "รับคืนจาก ฝ่ายผลิต");
-  assert.strictEqual(f2["สาเหตุ"], "ตะปูหลุด");
-  assert.strictEqual(f2["จำนวน"], "1 ตัว");
-  assert.strictEqual(f2["ผู้ทำรายการ"], T.tester);
-  assert.strictEqual(f2["เลขที่ใบแจ้งซ่อม"], okData(F.G("repairs")).items[0].ticket_no);
+
+  // damaged return: ONE card (the return card, naming the opened ticket) - no separate damage card
+  let d2;
+  const p2 = F.one(() => { d2 = okData(F.P(Object.assign({ action: "return", type_id: 1, size: "1.2x1.2", qty: 1, department: "ฝ่ายผลิต", condition: "damaged", cause: "ตะปูหลุด", note: "ขาหัก 1 ขา" }, AT))); });
+  const t = okData(F.G("repairs")).items[0];
+  assert.strictEqual(titleOf(p2), "รับคืน (ชำรุด) " + d2.doc_no);
+  assert.strictEqual(linkOf(p2), SITE + "#history");
+  assert.deepStrictEqual(factsOf(p2), {
+    "เลขที่เอกสาร": d2.doc_no, "ประเภทพาเลท": "RM — พาเลทสำหรับใส่ RM", "ขนาด": "1.2x1.2 ม.", "จำนวน": "1 ตัว",
+    "รับคืนจากฝ่าย": "ฝ่ายผลิต", "สถานะหลังรับคืน": "ชำรุด — เปิดใบแจ้งซ่อม " + t.ticket_no, "สาเหตุ": "ตะปูหลุด",
+    "หมายเหตุ": "ขาหัก 1 ขา", "ผู้ทำรายการ": T.tester, "วันที่/เวลา": DTH
+  });
+  // a long (ticket) note is flattened and cut
+  const p3 = F.one(() => okData(F.P(Object.assign({ action: "return", type_id: 1, size: "1.2x1.2", qty: 1, department: "ฝ่ายผลิต", condition: "damaged", cause: "x", note: "a\tb " + "ก".repeat(400) }, AT))));
+  const n3 = factsOf(p3)["หมายเหตุ"];
+  assert.ok(n3.startsWith("a b กกก") && n3.endsWith("…") && Array.from(n3).length === 300, n3);
+  assert.ok(factsOf(p3)["สถานะหลังรับคืน"].startsWith("ชำรุด — เปิดใบแจ้งซ่อม "));
   F.noLeak();
 });
 
-test("Teams: repair_done and scrap -> one card each (ticket, type/size, qty, who); repair_start sends nothing", () => {
+test("Teams: damage from stock -> one card: ticket, type/size, qty, cause, who, when; links #repair", () => {
   const F = teamsInstance();
   okData(F.P(Object.assign({ action: "receive", type_id: 2, size: "1.1x1.1", qty: 20 }, AT)));
-  okData(F.P(Object.assign({ action: "damage", type_id: 2, size: "1.1x1.1", qty: 3, cause: "a" }, AT)));
-  okData(F.P(Object.assign({ action: "damage", type_id: 2, size: "1.1x1.1", qty: 4, cause: "b" }, AT)));
-  const [t2, t1] = okData(F.G("repairs")).items;
-  assert.strictEqual(F.sent(() => okData(F.P(Object.assign({ action: "repair_start", id: t1.id, person: "ช่างหนึ่ง" }, AT)))).length, 0);
-  // a long multi-line note is flattened and cut
-  const longNote = "เปลี่ยนไม้\nตอกตะปู\t" + "ก".repeat(400);
   let d;
-  const p = F.one(() => { d = okData(F.P(Object.assign({ action: "repair_done", id: t1.id, ticket_no: t1.ticket_no, note: longNote }, AT), "ช่างสมศักดิ์")); });
-  assert.strictEqual(titleOf(p), "ซ่อมเสร็จ " + t1.ticket_no);
+  const p = F.one(() => { d = okData(F.P(Object.assign({ action: "damage", type_id: 2, size: "1.1x1.1", qty: 3, cause: "ไม้หัก", person: "C" }, AT), "สมชาย")); });
+  const t = okData(F.G("repairs")).items[0];
+  assert.strictEqual(titleOf(p), "แจ้งชำรุด " + t.ticket_no);
   assert.strictEqual(linkOf(p), SITE + "#repair");
-  const f = factsOf(p);
-  assert.deepStrictEqual([f["เลขที่ใบแจ้งซ่อม"], f["ประเภทพาเลท"], f["ขนาด"], f["จำนวน"], f["ช่างผู้ซ่อม"], f["เลขที่เอกสาร"], f["วันที่/เวลา"], f["ผู้ทำรายการ"]],
-    [t1.ticket_no, "PK — พาเลทสำหรับใส่ PK", "1.1x1.1 ม.", "3 ตัว", "ช่างหนึ่ง", d.doc_no, DTH, "ช่างสมศักดิ์"]);
-  assert.ok(f["หมายเหตุ"].startsWith("เปลี่ยนไม้ ตอกตะปู กกก") && f["หมายเหตุ"].endsWith("…"), f["หมายเหตุ"]);
-  assert.strictEqual(Array.from(f["หมายเหตุ"]).length, 300);
-  assert.ok(!/[\n\t]/.test(JSON.stringify(Object.values(f))));
-
-  const s = F.one(() => okData(F.P(Object.assign({ action: "scrap", id: t2.id, note: "แตกหมด" }, AT))));
-  assert.strictEqual(titleOf(s), "ซ่อมไม่ได้ / ตัดจำหน่าย " + t2.ticket_no);
-  const fs2 = factsOf(s);
-  assert.deepStrictEqual([fs2["จำนวน"], fs2["จากสถานะ"], fs2["หมายเหตุ"], fs2["ผู้ทำรายการ"]], ["4 ตัว", "ชำรุด", "แตกหมด", T.tester]);
-  assert.strictEqual(detailOf(s), null);
+  assert.strictEqual(p.attachments[0].content.body[1].color, "Attention");
+  assert.deepStrictEqual(factsOf(p), {
+    "เลขที่ใบแจ้งซ่อม": t.ticket_no, "ประเภทพาเลท": "PK — พาเลทสำหรับใส่ PK", "ขนาด": "1.1x1.1 ม.", "จำนวน": "3 ตัว",
+    "สาเหตุ": "ไม้หัก", "เลขที่เอกสาร": d.doc_no, "ชื่อที่ระบุ": "C", "ผู้ทำรายการ": "สมชาย", "วันที่/เวลา": DTH
+  });
+  // overridable site URL; a non-web value falls back to the default
+  F.g.state.props.PALLET_SITE_URL = "https://example.test/hub/#old";
+  assert.strictEqual(linkOf(F.one(() => okData(F.P(Object.assign({ action: "damage", type_id: 2, size: "1.1x1.1", qty: 1 }, AT))))), "https://example.test/hub/#repair");
+  F.g.state.props.PALLET_SITE_URL = "javascript:alert(1)";
+  const p2 = F.one(() => okData(F.P(Object.assign({ action: "damage", type_id: 2, size: "1.1x1.1", qty: 1 }, AT))));
+  assert.strictEqual(linkOf(p2), SITE + "#repair");
+  assert.strictEqual(factsOf(p2)["สาเหตุ"], "-");
   F.noLeak();
 });
 
-test("Teams: record edits / deletes and reset_data -> one card each with the audit log's before→after detail", () => {
+test("Teams: receive / issue / repair_start / repair_done / scrap / record edits & deletes / reset / department changes send nothing", () => {
   const F = teamsInstance();
-  const logDetail = () => okData(F.P({ action: "logs", resetPassword: RPW }, null)).items[0].detail;
-  okData(F.P(Object.assign({ action: "receive", type_id: 1, size: "1.2x1.2", qty: 10 }, AT)));
-  const rc2 = okData(F.P(Object.assign({ action: "receive", type_id: 1, size: "1.2x1.2", qty: 3 }, AT)));
-  okData(F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 2, cause: "หัก" }, AT)));
-  const t = okData(F.G("repairs")).items[0];
-  const m = okData(F.G("history", { act: "receive" })).items.find(x => x.qty === 10);
-
-  let p = F.one(() => okData(F.R("movement_update", { id: m.id, doc_no: m.doc_no, qty: 12, note: "แก้ PO" }, "Editor")));
-  assert.strictEqual(titleOf(p), "แก้ไขรายการ " + m.doc_no);
-  assert.strictEqual(linkOf(p), SITE + "#history");
-  assert.strictEqual(detailOf(p), logDetail());
-  assert.ok(detailOf(p).includes("จำนวน 10 → 12") && detailOf(p).includes('หมายเหตุ "" → "แก้ PO"'), detailOf(p));
-  assert.strictEqual(factsOf(p)["ผู้ทำรายการ"], T.tester);
-  // no change -> nothing saved, nothing sent
-  assert.strictEqual(F.sent(() => okData(F.R("movement_update", { id: m.id, qty: 12 }))).length, 0);
-
-  p = F.one(() => okData(F.R("repair_update", { id: t.id, cause: "หักสองแผ่น" })));
-  assert.strictEqual(titleOf(p), "แก้ไขใบแจ้งซ่อม " + t.ticket_no);
-  assert.strictEqual(linkOf(p), SITE + "#repair");
-  assert.strictEqual(detailOf(p), `แก้ไขใบแจ้งซ่อม ${t.ticket_no}: สาเหตุการชำรุด "หัก" → "หักสองแผ่น"`);
-
-  p = F.one(() => okData(F.R("movement_delete", { id: rc2.id, doc_no: rc2.doc_no })));
-  assert.strictEqual(titleOf(p), "ลบรายการ " + rc2.doc_no);
-  assert.strictEqual(linkOf(p), SITE + "#history");
-  assert.strictEqual(detailOf(p), logDetail());
-
-  F.g.state.props.PALLET_SITE_URL = "https://example.test/hub/#old"; // overridable site URL
-  p = F.one(() => okData(F.R("repair_delete", { id: t.id, ticket_no: t.ticket_no })));
-  assert.strictEqual(titleOf(p), "ลบใบแจ้งซ่อม " + t.ticket_no);
-  assert.strictEqual(linkOf(p), "https://example.test/hub/#repair");
-  assert.strictEqual(detailOf(p), logDetail());
-  assert.ok(detailOf(p).startsWith("ลบรายการทั้งชุดงานซ่อม " + t.ticket_no));
-  F.g.state.props.PALLET_SITE_URL = "javascript:alert(1)"; // not a web URL -> default
-  p = F.one(() => okData(F.R("reset_data")));
-  assert.strictEqual(titleOf(p), "รีเซ็ตข้อมูล");
-  assert.strictEqual(linkOf(p), SITE);
-  assert.ok(/^รีเซ็ตข้อมูล: ล้างชีต movements \(\d+ แถว\)/.test(detailOf(p)), detailOf(p));
-  assert.deepStrictEqual(Object.keys(factsOf(p)), ["ผู้ทำรายการ"]);
+  okData(F.P(Object.assign({ action: "receive", type_id: 1, size: "1.2x1.2", qty: 20 }, AT)));
+  okData(F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 3, cause: "a" }, AT)));
+  okData(F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 2, cause: "b" }, AT)));
+  okData(F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 1, cause: "c" }, AT)));
+  const [t3, t2, t1] = okData(F.G("repairs")).items;
+  const before = F.g.state.fetches.length;
+  const f = F.sent(() => {
+    const rc = okData(F.P(Object.assign({ action: "receive", type_id: 1, size: "1.2x1.2", qty: 10 }, AT)));
+    const rc2 = okData(F.P(Object.assign({ action: "receive", type_id: 1, size: "1.2x1.2", qty: 3 }, AT)));
+    okData(F.P(Object.assign({ action: "issue", type_id: 1, size: "1.2x1.2", qty: 5, department: "ฝ่ายผลิต" }, AT)));
+    okData(F.P(Object.assign({ action: "repair_start", id: t1.id, person: "ช่าง" }, AT)));
+    okData(F.P(Object.assign({ action: "repair_done", id: t1.id, note: "ok" }, AT)));
+    okData(F.P(Object.assign({ action: "scrap", id: t2.id, note: "แตก" }, AT)));
+    okData(F.R("movement_update", { id: rc.id, qty: 12, note: "แก้" }));
+    okData(F.R("movement_delete", { id: rc2.id }));
+    okData(F.R("repair_update", { id: t3.id, cause: "ccc" }));
+    okData(F.R("repair_delete", { id: t3.id }));
+    okData(F.P({ action: "dept_save", name: "ฝ่ายใหม่", resetPassword: RPW }));
+    okData(F.R("reset_data"));
+  });
+  assert.strictEqual(before, 3);
+  assert.strictEqual(f.length, 0);
   F.noLeak();
 });
 
@@ -1836,6 +1816,8 @@ test("Teams: rejected writes (validation, wrong password, no name, lock timeout)
   const t = okData(F.G("repairs")).items[0];
   const m = okData(F.G("history", { act: "receive" })).items[0];
   const f = F.sent(() => {
+    err(F.P(Object.assign({ action: "return", type_id: 1, size: "1.2x1.2", qty: 1, department: "ฝ่ายผลิต" }, AT)), /ถือพาเลทนี้อยู่ 0 ตัว/);
+    err(F.P(Object.assign({ action: "return", type_id: 1, size: "1.2x1.2", qty: 1, department: "" }, AT)), /กรุณาเลือกฝ่ายที่คืน/);
     err(F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 99 }, AT)), /มีเพียง/);
     err(F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 1, note: "x".repeat(1001) }, AT)), /ยาวเกิน/);
     err(F.P(Object.assign({ action: "repair_done", id: t.id }, AT)), /ไม่ได้อยู่ระหว่างซ่อม/);
