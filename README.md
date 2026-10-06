@@ -66,6 +66,20 @@ test/gas-mock.js         ชุดทดสอบ (Node.js) จำลอง Apps
    อาจดีขึ้นหรือไม่ก็ได้ เพราะ trigger กับคำขอจากหน้าเว็บไม่จำเป็นต้องใช้เครื่อง/อินสแตนซ์เดียวกัน (Google ไม่รับประกัน)
 5. trigger ใช้โควตาเวลารันของบัญชี Google เล็กน้อย (วันละ 144 ครั้ง ครั้งละไม่กี่วินาที)
 
+### 7. (ไม่บังคับ) แจ้งเตือนใน Microsoft Teams
+1. ใน Teams เปิดช่อง (channel) ที่ต้องการ → **⋯ → Workflows** → เลือกเทมเพลต
+   **"Post to a channel when a webhook request is received"** → เลือก Team/Channel → **Add workflow** แล้วคัดลอก URL ที่ได้
+2. Apps Script → **Project Settings → Script properties** → เพิ่ม `TEAMS_WEBHOOK_URL` = URL นั้น
+   (เก็บใน Script Properties เท่านั้น **ห้ามใส่ในซอร์สโค้ด** — ไม่ตั้ง/ค่าว่าง = ไม่แจ้งเตือน ระบบทำงานปกติ)
+3. เลือกฟังก์ชัน **`testTeamsNotification`** แล้วกด **Run** — ครั้งแรกจะขออนุญาตสิทธิ์ใหม่
+   "เชื่อมต่อกับบริการภายนอก" (`script.external_request`) → Allow · ผลใน Execution log ต้องได้ `"sent":true` (HTTP 2xx) และเห็นการ์ดทดสอบในช่อง
+4. **Deploy → Manage deployments → New version** เพื่อให้ Web App ใช้โค้ดใหม่
+5. สิ่งที่แจ้ง (การ์ดสีแดง 1 ใบต่อเหตุการณ์ พร้อมชื่อผู้ทำรายการ เวลาไทย และปุ่ม "เปิด Pallet Hub"):
+   แจ้งชำรุด/รับคืนชำรุด (เลขใบแจ้งซ่อม ประเภท ขนาด จำนวน ที่มา สาเหตุ), ซ่อมเสร็จ, ซ่อมไม่ได้/ตัดจำหน่าย,
+   แก้ไข/ลบรายการ/ใบแจ้งซ่อม และรีเซ็ตข้อมูล (รายละเอียด ก่อน → หลัง เหมือนใน Log) — รับเข้า/เบิก/รับคืนปกติ **ไม่แจ้ง**
+6. ส่งหลังบันทึกสำเร็จและปลดล็อกแล้ว ถ้า Teams ล่มหรือ URL ผิด การบันทึกยังสำเร็จตามปกติ (ดูสาเหตุใน Executions: HTTP status)
+   ลิงก์ในการ์ดใช้ `PALLET_SITE_URL` (Script Property) ถ้าตั้งไว้ ไม่งั้นใช้ https://watanathep8-dotcom.github.io/pallet-management/
+
 ### อัปเดตจากเวอร์ชันก่อน (มีข้อมูลอยู่แล้ว)
 - วาง `Code.gs` ใหม่ → **Deploy → Manage deployments → New version** (URL เดิม) แล้วอัปโหลด `docs/` ใหม่
 - ไม่ต้องสร้างสเปรดชีตใหม่ ข้อมูลเดิมอยู่ครบ: สเปรดชีตจากเวอร์ชันที่มีระบบเข้าสู่ระบบใช้ได้ทันที — คอลัมน์ `username`
@@ -117,7 +131,7 @@ test/gas-mock.js         ชุดทดสอบ (Node.js) จำลอง Apps
   เปลี่ยนเวอร์ชันทันทีหลังเขียนชีตเสร็จ จึงไม่ได้ข้อมูลเก่าหลังบันทึก — ถ้าแก้ข้อมูลในชีตด้วยมือ จะเห็นผลภายใน 10 นาที
   (ถ้าเปิด keep-warm ไว้: ภายในรอบถัดไปของ `keepWarm` ไม่เกินประมาณ 10–15 นาที)
   หรือรันฟังก์ชัน `clearReadCache()` ใน Apps Script editor เพื่อให้เห็นทันที
-- `keepWarm()` / `installKeepWarmTrigger()` / `removeKeepWarmTrigger()` รันจาก editor หรือ trigger เท่านั้น (เรียกผ่าน URL ของ Web App ไม่ได้)
+- `keepWarm()` / `installKeepWarmTrigger()` / `removeKeepWarmTrigger()` / `testTeamsNotification()` รันจาก editor หรือ trigger เท่านั้น (เรียกผ่าน URL ของ Web App ไม่ได้)
 - ทุกการบันทึกทำภายใต้ `LockService` (ป้องกันเลขที่เอกสารซ้ำเมื่อบันทึกพร้อมกัน)
 
 ## ทดสอบ
@@ -125,7 +139,7 @@ test/gas-mock.js         ชุดทดสอบ (Node.js) จำลอง Apps
 ```
 node test/gas-mock.js
 ```
-ชุดทดสอบจำลอง SpreadsheetApp / PropertiesService / CacheService / LockService / Utilities / ContentService
+ชุดทดสอบจำลอง SpreadsheetApp / PropertiesService / CacheService / LockService / Utilities / ContentService / UrlFetchApp (ไม่ส่งออกเน็ตจริง)
 แล้วรัน `setupSystem()` และทดสอบทุก action ผ่าน `doGet` / `doPost` (รวมการล็อก รหัสรีเซ็ตข้อมูล/Log การบันทึกผู้ทำรายการ
 batch และแคชการอ่าน (ข้อมูลไม่เก่าหลังการบันทึกทุกแบบ) การอัปเกรดสเปรดชีตเดิม และการเปลี่ยนสถานะทุกแบบ)
 

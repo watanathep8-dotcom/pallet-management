@@ -16,7 +16,7 @@ const ROOT = path.join(__dirname, "..");
 
 /* ===================== mocks ===================== */
 function createGas() {
-  const state = { props: {}, cache: {}, cachePuts: [], cachePutAlls: [], cacheGetAlls: 0, flushes: 0, cacheDown: false, sheetReads: {}, rowReads: 0, events: [], sleeps: 0, locks: 0, unlocks: 0, lockFail: false, spreadsheets: {}, seq: 0, formatCalls: 0, created: 0 };
+  const state = { props: {}, cache: {}, cachePuts: [], cachePutAlls: [], cacheGetAlls: 0, flushes: 0, cacheDown: false, sheetReads: {}, rowReads: 0, events: [], sleeps: 0, locks: 0, unlocks: 0, lockFail: false, spreadsheets: {}, seq: 0, formatCalls: 0, created: 0, fetches: [], fetchStatus: 202, fetchError: null, logs: [] };
 
   class Range {
     constructor(sheet, row, col, nr, nc) {
@@ -181,7 +181,23 @@ function createGas() {
       }
     },
     Logger: { log() {} },
-    console: { log() {}, error: console.error, warn: console.warn },
+    // Everything Code.gs logs is kept in state.logs (checked for leaked secrets).
+    console: {
+      log(...a) { state.logs.push(["log", a.join(" ")]); },
+      warn(...a) { state.logs.push(["warn", a.join(" ")]); },
+      error(...a) { state.logs.push(["error", a.join(" ")]); console.error(...a); }
+    },
+    // Teams webhook: never touches the network. Records each call (and whether the
+    // script lock was held at that moment); answers state.fetchStatus or throws
+    // state.fetchError.
+    UrlFetchApp: {
+      fetch(url, opts) {
+        state.fetches.push({ url, opts, lockHeld: state.locks !== state.unlocks });
+        if (state.fetchError) throw new Error(state.fetchError);
+        const code = state.fetchStatus;
+        return { getResponseCode: () => code, getContentText: () => "" };
+      }
+    },
     // Project triggers (keep-warm). state.triggers: [{handler, everyMinutes, id}]
     ScriptApp: {
       getProjectTriggers() {
@@ -1648,6 +1664,265 @@ test("a new repair ticket's note is limited like ticket edits (1000 characters)"
   err(F.P(Object.assign({ action: "return", type_id: 1, size: "1.2x1.2", qty: 1, department: "ฝ่ายผลิต", condition: "damaged", cause: "a", note: "x".repeat(1001) }, AT)), /หมายเหตุยาวเกิน 1000/);
   assert.strictEqual(F.rows("repairs").length, n);
   okData(F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 1, cause: "a", note: "  " + "x".repeat(1000) + "  " }, AT)));
+});
+
+/* ---------- Microsoft Teams notifications ---------- */
+// A Workflows webhook URL carries its signature in the query string: it must never leak.
+const HOOK = "https://prod-00.southeastasia.logic.azure.com:443/workflows/0a1b2c/triggers/manual/paths/invoke?api-version=2016-06-01&sp=%2Ftriggers&sv=1.0&sig=SECRET-SIG-123";
+const SITE = "https://watanathep8-dotcom.github.io/pallet-management/";
+const card = f => JSON.parse(f.opts.payload);
+const factsOf = p => Object.fromEntries(p.attachments[0].content.body.find(b => b.type === "FactSet").facts.map(x => [x.title, x.value]));
+const detailOf = p => { const b = p.attachments[0].content.body; return b.length > 4 ? b[4].text : null; };
+const titleOf = p => p.attachments[0].content.body[1].text;
+const linkOf = p => p.attachments[0].content.actions[0].url;
+const DTH = `${TODAY.slice(8, 10)}/${TODAY.slice(5, 7)}/${TODAY.slice(0, 4)} ${HOUR}:00 น.`;
+// Teams-enabled instance; every response text is kept so leaks can be checked.
+function teamsInstance(hook = HOOK) {
+  const F = freshInstance();
+  if (hook !== null) F.g.state.props.TEAMS_WEBHOOK_URL = hook;
+  F.texts = [];
+  const P0 = F.P;
+  F.P = (payload, who) => { const r = P0(payload, who); F.texts.push(JSON.stringify(r)); return r; };
+  F.R = (action, body = {}) => F.P(Object.assign({}, body, { action, resetPassword: RPW }));
+  // fetches made by fn()
+  F.sent = fn => { const n = F.g.state.fetches.length; fn(); return F.g.state.fetches.slice(n); };
+  F.one = fn => { const f = F.sent(fn); assert.strictEqual(f.length, 1, "expected one Teams fetch, got " + f.length); return card(f[0]); };
+  F.noLeak = () => {
+    const all = F.texts.join("\n") + "\n" + F.g.state.logs.map(l => l[1]).join("\n") + "\n" + F.dump();
+    assert.ok(!all.includes(HOOK) && !all.includes("SECRET-SIG") && !all.includes("logic.azure.com"), "webhook URL leaked");
+  };
+  return F;
+}
+
+test("Teams: TEAMS_WEBHOOK_URL unset or blank -> no fetch for any event, writes work as before", () => {
+  for (const hook of [null, "", "   "]) {
+    const F = teamsInstance(hook);
+    const f = F.sent(() => {
+      okData(F.P(Object.assign({ action: "receive", type_id: 1, size: "1.2x1.2", qty: 10 }, AT)));
+      okData(F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 2, cause: "x" }, AT)));
+      const t = okData(F.G("repairs")).items[0];
+      okData(F.P(Object.assign({ action: "repair_start", id: t.id }, AT)));
+      okData(F.P(Object.assign({ action: "repair_done", id: t.id }, AT)));
+      const m = okData(F.G("history", { act: "receive" })).items[0];
+      okData(F.R("movement_update", { id: m.id, note: "n" }));
+      okData(F.R("reset_data"));
+    });
+    assert.strictEqual(f.length, 0, "hook " + JSON.stringify(hook));
+    assert.ok(!F.g.state.logs.some(l => /Teams/.test(l[1])), "silently skipped");
+  }
+});
+
+test("Teams: damage (from stock / returned damaged) -> one Adaptive Card each with ticket, type, size, qty, source, cause, who", () => {
+  const F = teamsInstance();
+  // ordinary receive / issue / return / repair_start / dept settings: no notification
+  const quiet = F.sent(() => {
+    okData(F.P(Object.assign({ action: "receive", type_id: 1, size: "1.2x1.2", qty: 20 }, AT)));
+    okData(F.P(Object.assign({ action: "issue", type_id: 1, size: "1.2x1.2", qty: 5, department: "ฝ่ายผลิต" }, AT)));
+    okData(F.P(Object.assign({ action: "return", type_id: 1, size: "1.2x1.2", qty: 1, department: "ฝ่ายผลิต", condition: "good" }, AT)));
+    okData(F.P({ action: "dept_save", name: "ฝ่ายใหม่", resetPassword: RPW }));
+  });
+  assert.strictEqual(quiet.length, 0);
+
+  let d;
+  const f = F.sent(() => { d = okData(F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 2, cause: "ไม้หัก", person: "C" }, AT), "สมชาย")); });
+  assert.strictEqual(f.length, 1);
+  assert.strictEqual(f[0].url, HOOK);
+  assert.deepStrictEqual(Object.assign({}, f[0].opts, { payload: undefined }), { method: "post", contentType: "application/json", payload: undefined, muteHttpExceptions: true });
+  assert.strictEqual(f[0].lockHeld, false, "sent after the lock was released");
+  const p = card(f[0]);
+  assert.strictEqual(p.type, "message");
+  assert.strictEqual(p.attachments.length, 1);
+  const a = p.attachments[0];
+  assert.strictEqual(a.contentType, "application/vnd.microsoft.card.adaptive");
+  assert.strictEqual(a.contentUrl, null);
+  assert.strictEqual(a.content.$schema, "http://adaptivecards.io/schemas/adaptive-card.json");
+  assert.strictEqual(a.content.type, "AdaptiveCard");
+  assert.strictEqual(a.content.version, "1.4");
+  assert.strictEqual(a.content.body[1].color, "Attention");
+  assert.ok(/^แจ้งเมื่อ \d\d\/\d\d\/\d{4} \d\d:\d\d น\. \(เวลาไทย\)$/.test(a.content.body[2].text), a.content.body[2].text);
+  assert.deepStrictEqual(a.content.actions, [{ type: "Action.OpenUrl", title: "เปิด Pallet Hub", url: SITE + "#repair" }]);
+  const t = okData(F.G("repairs")).items[0];
+  assert.strictEqual(titleOf(p), "แจ้งชำรุด " + t.ticket_no);
+  assert.deepStrictEqual(factsOf(p), {
+    "เลขที่ใบแจ้งซ่อม": t.ticket_no, "ประเภทพาเลท": "RM — พาเลทสำหรับใส่ RM", "ขนาด": "1.2x1.2 ม.", "จำนวน": "2 ตัว",
+    "ที่มา": "จากคลัง (พร้อมใช้)", "สาเหตุ": "ไม้หัก", "เลขที่เอกสาร": d.doc_no, "วันที่/เวลา": DTH, "ผู้ทำรายการ": "สมชาย"
+  });
+  // returned damaged from a department
+  const p2 = F.one(() => okData(F.P(Object.assign({ action: "return", type_id: 1, size: "1.2x1.2", qty: 1, department: "ฝ่ายผลิต", condition: "damaged", cause: "ตะปูหลุด" }, AT))));
+  const f2 = factsOf(p2);
+  assert.strictEqual(f2["ที่มา"], "รับคืนจาก ฝ่ายผลิต");
+  assert.strictEqual(f2["สาเหตุ"], "ตะปูหลุด");
+  assert.strictEqual(f2["จำนวน"], "1 ตัว");
+  assert.strictEqual(f2["ผู้ทำรายการ"], T.tester);
+  assert.strictEqual(f2["เลขที่ใบแจ้งซ่อม"], okData(F.G("repairs")).items[0].ticket_no);
+  F.noLeak();
+});
+
+test("Teams: repair_done and scrap -> one card each (ticket, type/size, qty, who); repair_start sends nothing", () => {
+  const F = teamsInstance();
+  okData(F.P(Object.assign({ action: "receive", type_id: 2, size: "1.1x1.1", qty: 20 }, AT)));
+  okData(F.P(Object.assign({ action: "damage", type_id: 2, size: "1.1x1.1", qty: 3, cause: "a" }, AT)));
+  okData(F.P(Object.assign({ action: "damage", type_id: 2, size: "1.1x1.1", qty: 4, cause: "b" }, AT)));
+  const [t2, t1] = okData(F.G("repairs")).items;
+  assert.strictEqual(F.sent(() => okData(F.P(Object.assign({ action: "repair_start", id: t1.id, person: "ช่างหนึ่ง" }, AT)))).length, 0);
+  // a long multi-line note is flattened and cut
+  const longNote = "เปลี่ยนไม้\nตอกตะปู\t" + "ก".repeat(400);
+  let d;
+  const p = F.one(() => { d = okData(F.P(Object.assign({ action: "repair_done", id: t1.id, ticket_no: t1.ticket_no, note: longNote }, AT), "ช่างสมศักดิ์")); });
+  assert.strictEqual(titleOf(p), "ซ่อมเสร็จ " + t1.ticket_no);
+  assert.strictEqual(linkOf(p), SITE + "#repair");
+  const f = factsOf(p);
+  assert.deepStrictEqual([f["เลขที่ใบแจ้งซ่อม"], f["ประเภทพาเลท"], f["ขนาด"], f["จำนวน"], f["ช่างผู้ซ่อม"], f["เลขที่เอกสาร"], f["วันที่/เวลา"], f["ผู้ทำรายการ"]],
+    [t1.ticket_no, "PK — พาเลทสำหรับใส่ PK", "1.1x1.1 ม.", "3 ตัว", "ช่างหนึ่ง", d.doc_no, DTH, "ช่างสมศักดิ์"]);
+  assert.ok(f["หมายเหตุ"].startsWith("เปลี่ยนไม้ ตอกตะปู กกก") && f["หมายเหตุ"].endsWith("…"), f["หมายเหตุ"]);
+  assert.strictEqual(Array.from(f["หมายเหตุ"]).length, 300);
+  assert.ok(!/[\n\t]/.test(JSON.stringify(Object.values(f))));
+
+  const s = F.one(() => okData(F.P(Object.assign({ action: "scrap", id: t2.id, note: "แตกหมด" }, AT))));
+  assert.strictEqual(titleOf(s), "ซ่อมไม่ได้ / ตัดจำหน่าย " + t2.ticket_no);
+  const fs2 = factsOf(s);
+  assert.deepStrictEqual([fs2["จำนวน"], fs2["จากสถานะ"], fs2["หมายเหตุ"], fs2["ผู้ทำรายการ"]], ["4 ตัว", "ชำรุด", "แตกหมด", T.tester]);
+  assert.strictEqual(detailOf(s), null);
+  F.noLeak();
+});
+
+test("Teams: record edits / deletes and reset_data -> one card each with the audit log's before→after detail", () => {
+  const F = teamsInstance();
+  const logDetail = () => okData(F.P({ action: "logs", resetPassword: RPW }, null)).items[0].detail;
+  okData(F.P(Object.assign({ action: "receive", type_id: 1, size: "1.2x1.2", qty: 10 }, AT)));
+  const rc2 = okData(F.P(Object.assign({ action: "receive", type_id: 1, size: "1.2x1.2", qty: 3 }, AT)));
+  okData(F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 2, cause: "หัก" }, AT)));
+  const t = okData(F.G("repairs")).items[0];
+  const m = okData(F.G("history", { act: "receive" })).items.find(x => x.qty === 10);
+
+  let p = F.one(() => okData(F.R("movement_update", { id: m.id, doc_no: m.doc_no, qty: 12, note: "แก้ PO" }, "Editor")));
+  assert.strictEqual(titleOf(p), "แก้ไขรายการ " + m.doc_no);
+  assert.strictEqual(linkOf(p), SITE + "#history");
+  assert.strictEqual(detailOf(p), logDetail());
+  assert.ok(detailOf(p).includes("จำนวน 10 → 12") && detailOf(p).includes('หมายเหตุ "" → "แก้ PO"'), detailOf(p));
+  assert.strictEqual(factsOf(p)["ผู้ทำรายการ"], T.tester);
+  // no change -> nothing saved, nothing sent
+  assert.strictEqual(F.sent(() => okData(F.R("movement_update", { id: m.id, qty: 12 }))).length, 0);
+
+  p = F.one(() => okData(F.R("repair_update", { id: t.id, cause: "หักสองแผ่น" })));
+  assert.strictEqual(titleOf(p), "แก้ไขใบแจ้งซ่อม " + t.ticket_no);
+  assert.strictEqual(linkOf(p), SITE + "#repair");
+  assert.strictEqual(detailOf(p), `แก้ไขใบแจ้งซ่อม ${t.ticket_no}: สาเหตุการชำรุด "หัก" → "หักสองแผ่น"`);
+
+  p = F.one(() => okData(F.R("movement_delete", { id: rc2.id, doc_no: rc2.doc_no })));
+  assert.strictEqual(titleOf(p), "ลบรายการ " + rc2.doc_no);
+  assert.strictEqual(linkOf(p), SITE + "#history");
+  assert.strictEqual(detailOf(p), logDetail());
+
+  F.g.state.props.PALLET_SITE_URL = "https://example.test/hub/#old"; // overridable site URL
+  p = F.one(() => okData(F.R("repair_delete", { id: t.id, ticket_no: t.ticket_no })));
+  assert.strictEqual(titleOf(p), "ลบใบแจ้งซ่อม " + t.ticket_no);
+  assert.strictEqual(linkOf(p), "https://example.test/hub/#repair");
+  assert.strictEqual(detailOf(p), logDetail());
+  assert.ok(detailOf(p).startsWith("ลบรายการทั้งชุดงานซ่อม " + t.ticket_no));
+  F.g.state.props.PALLET_SITE_URL = "javascript:alert(1)"; // not a web URL -> default
+  p = F.one(() => okData(F.R("reset_data")));
+  assert.strictEqual(titleOf(p), "รีเซ็ตข้อมูล");
+  assert.strictEqual(linkOf(p), SITE);
+  assert.ok(/^รีเซ็ตข้อมูล: ล้างชีต movements \(\d+ แถว\)/.test(detailOf(p)), detailOf(p));
+  assert.deepStrictEqual(Object.keys(factsOf(p)), ["ผู้ทำรายการ"]);
+  F.noLeak();
+});
+
+test("Teams: rejected writes (validation, wrong password, no name, lock timeout) send nothing", () => {
+  const F = teamsInstance();
+  okData(F.P(Object.assign({ action: "receive", type_id: 1, size: "1.2x1.2", qty: 5 }, AT)));
+  okData(F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 1, cause: "a" }, AT)));
+  const t = okData(F.G("repairs")).items[0];
+  const m = okData(F.G("history", { act: "receive" })).items[0];
+  const f = F.sent(() => {
+    err(F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 99 }, AT)), /มีเพียง/);
+    err(F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 1, note: "x".repeat(1001) }, AT)), /ยาวเกิน/);
+    err(F.P(Object.assign({ action: "repair_done", id: t.id }, AT)), /ไม่ได้อยู่ระหว่างซ่อม/);
+    err(F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 1 }, AT), null), /กรุณาระบุชื่อ/);
+    err(F.P({ action: "movement_delete", id: m.id, resetPassword: "wrong" }), /รหัสไม่ถูกต้อง/);
+    err(F.R("movement_delete", { id: m.id }), /^ลบไม่ได้/);
+    err(F.R("movement_update", { id: m.id, qty: 0 }), /มากกว่า 0/);
+    err(F.R("repair_update", { id: t.id, qty: 5 }), /แก้ไขจำนวน/);
+    F.g.state.lockFail = true;
+    try { err(F.P(Object.assign({ action: "scrap", id: t.id }, AT)), /ลองใหม่/); } finally { F.g.state.lockFail = false; }
+    // a write that fails while saving (sheet error during flush) is not announced either
+    const mv = F.ss.getSheetByName("movements");
+    const orig = mv.getRange;
+    mv.getRange = function () { throw new Error("Service Spreadsheets failed"); };
+    try { err(F.P(Object.assign({ action: "scrap", id: t.id }, AT))); } finally { mv.getRange = orig; }
+  });
+  assert.strictEqual(f.length, 0);
+  assert.strictEqual(F.g.state.locks, F.g.state.unlocks);
+  F.noLeak();
+});
+
+test("Teams: HTTP errors / fetch exceptions never change the response or the saved data; logged with status, never the URL", () => {
+  const run = (setup) => {
+    const F = teamsInstance();
+    setup(F.g.state);
+    frozenIn(F, () => {
+      okData(F.P(Object.assign({ action: "receive", type_id: 1, size: "1.2x1.2", qty: 9 }, AT)));
+      F.res = F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 2, cause: "x", reads: ["repairs"] }, AT));
+    });
+    return F;
+  };
+  const ok = run(() => {});
+  const base = ok.res;
+  okData(base);
+  assert.deepStrictEqual(Object.keys(base.data), ["doc_no", "id", "message", "reads"]);
+  for (const [label, setup, logRe] of [
+    ["HTTP 500", s => { s.fetchStatus = 500; }, /^Teams notification failed: HTTP 500$/],
+    ["HTTP 404", s => { s.fetchStatus = 404; }, /^Teams notification failed: HTTP 404$/],
+    ["exception with the URL in its message", s => { s.fetchError = "Address unavailable: " + HOOK; }, /^Teams notification failed: Address unavailable: \[webhook\]$/],
+    ["exception with another URL", s => { s.fetchError = "DNS error: https://other.example/x?sig=1"; }, /^Teams notification failed: DNS error: \[url\]$/]
+  ]) {
+    const F = run(setup);
+    assert.strictEqual(F.g.state.fetches.length, 1, label);
+    assert.deepStrictEqual(F.res, base, label + ": response unchanged");
+    const noClock = x => x.replace(/\d{4}-\d\d-\d\d \d\d:\d\d:\d\d/g, "<dt>"); // created_at differs between instances
+    assert.strictEqual(noClock(F.dump()), noClock(ok.dump()), label + ": data unchanged");
+    const warns = F.g.state.logs.filter(l => l[0] === "warn").map(l => l[1]);
+    assert.strictEqual(warns.length, 1, label);
+    assert.ok(logRe.test(warns[0]), label + ": " + warns[0]);
+    assert.strictEqual(F.g.state.locks, F.g.state.unlocks);
+    F.noLeak();
+  }
+  // a non-https webhook value is refused (warned, without the value) and not called
+  const H = teamsInstance("http://insecure.example/hook?sig=SECRET-SIG-9");
+  okData(H.P(Object.assign({ action: "receive", type_id: 1, size: "1.2x1.2", qty: 9 }, AT)));
+  okData(H.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 1 }, AT)));
+  assert.strictEqual(H.g.state.fetches.length, 0);
+  assert.ok(H.g.state.logs.some(l => /TEAMS_WEBHOOK_URL must be an https/.test(l[1])));
+  assert.ok(!H.g.state.logs.some(l => /SECRET-SIG|insecure/.test(l[1])));
+});
+
+test("testTeamsNotification: sends one sample card, returns / logs the HTTP status (never the URL); not a web action", () => {
+  const off = teamsInstance(null);
+  const r0 = off.c.testTeamsNotification();
+  assert.deepStrictEqual([r0.sent, r0.status], [false, null]);
+  assert.ok(r0.message.includes("TEAMS_WEBHOOK_URL"));
+  assert.strictEqual(off.g.state.fetches.length, 0);
+
+  const F = teamsInstance();
+  const r = F.c.testTeamsNotification();
+  assert.deepStrictEqual([r.sent, r.status], [true, 202]);
+  assert.strictEqual(F.g.state.fetches.length, 1);
+  const p = card(F.g.state.fetches[0]);
+  assert.strictEqual(titleOf(p), "ทดสอบการแจ้งเตือน");
+  assert.strictEqual(p.attachments[0].content.type, "AdaptiveCard");
+  assert.strictEqual(linkOf(p), SITE);
+  assert.ok(F.g.state.logs.some(l => l[0] === "log" && l[1].includes('"status":202')));
+  F.g.state.fetchStatus = 400;
+  const bad = F.c.testTeamsNotification();
+  assert.deepStrictEqual([bad.sent, bad.status], [false, 400]);
+  assert.ok(bad.message.includes("HTTP 400"));
+  F.g.state.fetchStatus = 202;
+  F.texts.push(JSON.stringify([r0, r, bad]));
+  for (const a of ["testTeamsNotification", "notifyTeams_", "sendTeams_"]) err(F.P({ action: a }), /^Unknown action$/);
+  err(F.G("testTeamsNotification"), /^Unknown action$/);
+  assert.strictEqual(F.g.state.fetches.length, 2);
+  F.noLeak();
 });
 
 /* ---------- frontend ---------- */

@@ -28,6 +28,14 @@
  * Optional: run installKeepWarmTrigger() once from the editor; a 10-minute
  * trigger then runs keepWarm() (read-only) to keep the read cache hot.
  *
+ * Optional Microsoft Teams notifications: set Script Property
+ * TEAMS_WEBHOOK_URL to the URL of a Teams Workflow "Post to a channel when a
+ * webhook request is received" (the URL lives only there, never in source).
+ * After a successful damage report, repair_done, scrap, record edit/delete or
+ * reset_data, one Adaptive Card is posted - after the lock is released, and a
+ * failure never changes the API response or the saved data. Unset = no
+ * notifications. Run testTeamsNotification() from the editor to check it.
+ *
  * Transport:
  *   GET  ?action=<read action>&...params -> {ok:true,data} | {ok:false,error}
  *   POST text/plain JSON {action, actor, ...fields}
@@ -55,6 +63,14 @@ var RESET_PASSWORD_ACTIONS = [RESET_ACTION, "movement_update", "movement_delete"
 // Reading the audit log also needs the reset password (POST only, so the
 // password never travels in a URL).
 var LOG_ACTIONS = ["logs", "logs_export"];
+
+// Microsoft Teams notifications (see sendTeams_). Both values are Script
+// Properties; the webhook URL is never logged or returned.
+var TEAMS_WEBHOOK_PROPERTY = "TEAMS_WEBHOOK_URL";
+var SITE_URL_PROPERTY = "PALLET_SITE_URL";
+var DEFAULT_SITE_URL = "https://watanathep8-dotcom.github.io/pallet-management/";
+var TEAMS_MAX_FACT = 300;    // characters per card fact value
+var TEAMS_MAX_DETAIL = 1500; // characters of the before -> after text
 
 // Asia/Bangkok has no daylight saving time, so a fixed +07:00 offset gives the
 // same wall-clock values as PHP's date_default_timezone_set('Asia/Bangkok').
@@ -230,11 +246,15 @@ function runWrite_(action, input, reads) {
   }
   var actor = actorIn_(input);
   var result;
+  var notice = null;
   try {
     resetRequest_(actor);
     try {
       result = handleWrite_(action, input);
       flush_();
+      // Teams notice of this write: taken only once the changes are saved.
+      notice = REQ_.teams;
+      if (notice) { notice.action = action; notice.actor = actor; }
       // Versions as of this write, taken while the lock is held: the sheets this
       // request already holds in memory match them exactly (used by afterReads_).
       if (reads) versions_();
@@ -256,7 +276,11 @@ function runWrite_(action, input, reads) {
   }
   // Outside the lock: reads for the page the client shows next (post-write state).
   if (reads) result.reads = afterReads_(reads);
-  return jsonResponse_({ ok: true, data: result });
+  var response = jsonResponse_({ ok: true, data: result });
+  // Outside the lock too, and after the response is built: never blocks other
+  // writers and never changes the answer (notifyTeams_ does not throw).
+  if (notice) notifyTeams_(notice);
+  return response;
 }
 
 /* ===================== reads: single, batch, after a write ===================== */
@@ -622,9 +646,10 @@ function actionReturn_(input) {
   var r, msg;
   if ((input.condition == null ? "good" : input.condition) === "damaged") {
     var cause = textIn_(input, "cause", MAX_TEXT, "สาเหตุการชำรุด");
-    var rid = createTicket_(b.type, b.size, b.qty, "issued", dept, input, at);
+    var tk = createTicket_(b.type, b.size, b.qty, "issued", dept, input, at);
     r = move_("damage", b.type, b.size, b.qty, "issued", "damaged",
-      { department: dept, person: person, note: "คืนสภาพชำรุด: " + cause, repair_id: rid, moved_at: at });
+      { department: dept, person: person, note: "คืนสภาพชำรุด: " + cause, repair_id: tk.id, moved_at: at });
+    teamsNotice_({ kind: "damage", ticket: tk, type: b.t, doc_no: r.doc_no, at: at });
     msg = "รับคืนชำรุด " + b.qty + " ตัว — เปิดใบแจ้งซ่อมแล้ว";
   } else {
     var note = textIn_(input, "note", MAX_TEXT, "หมายเหตุ");
@@ -643,9 +668,10 @@ function actionDamage_(input) {
   var at = moment_(input);
   var person = textIn_(input, "person", MAX_PERSON, "ชื่อผู้ทำรายการ");
   var cause = textIn_(input, "cause", MAX_TEXT, "สาเหตุการชำรุด");
-  var rid = createTicket_(b.type, b.size, b.qty, "available", null, input, at);
+  var tk = createTicket_(b.type, b.size, b.qty, "available", null, input, at);
   var r = move_("damage", b.type, b.size, b.qty, "available", "damaged",
-    { person: person, note: cause, repair_id: rid, moved_at: at });
+    { person: person, note: cause, repair_id: tk.id, moved_at: at });
+  teamsNotice_({ kind: "damage", ticket: tk, type: b.t, doc_no: r.doc_no, at: at });
   r.message = "แจ้งชำรุด " + b.qty + " ตัว เรียบร้อย";
   return r;
 }
@@ -678,6 +704,7 @@ function actionRepairDone_(input) {
   }));
   var r = move_("repair_done", rp.type_id, rp.size, rp.qty, "repairing", "available",
     { person: phpTruthy_(person) ? person : rp.repairer, note: rp.ticket_no, repair_id: rp.id, moved_at: at });
+  teamsNotice_({ kind: "repair_done", ticket: rp, type: getType_(rp.type_id), doc_no: r.doc_no, at: at, note: phpTrim_(rawNote) });
   r.message = "ซ่อมเสร็จ " + rp.qty + " ตัว กลับเข้าคลังพร้อมใช้";
   return r;
 }
@@ -693,6 +720,7 @@ function actionScrap_(input) {
   update_("repairs", rp, stampTicket_({ stage: "scrapped", finished_at: at }));
   var r = move_("scrap", rp.type_id, rp.size, rp.qty, fromStage, "scrapped",
     { person: person, note: rp.ticket_no + " " + note, repair_id: rp.id, moved_at: at });
+  teamsNotice_({ kind: "scrap", ticket: rp, type: getType_(rp.type_id), doc_no: r.doc_no, at: at, note: note, from: fromStage });
   r.message = "ตัดจำหน่าย " + rp.qty + " ตัว แล้ว";
   return r;
 }
@@ -748,9 +776,10 @@ function actionResetData_() {
   REQ_.updates = REQ_.updates.filter(function (u) { return RESET_TABLES.indexOf(u.name) === -1; });
   REQ_.deletes = REQ_.deletes.filter(function (d) { return RESET_TABLES.indexOf(d.name) === -1; });
 
-  audit_("setting", "รีเซ็ตข้อมูล",
-    "รีเซ็ตข้อมูล: ล้างชีต movements (" + removed.movements + " แถว), repairs (" + removed.repairs +
-    " แถว), audit_logs (" + removed.audit_logs + " แถว) · คงไว้: pallet_types, departments");
+  var detail = "รีเซ็ตข้อมูล: ล้างชีต movements (" + removed.movements + " แถว), repairs (" + removed.repairs +
+    " แถว), audit_logs (" + removed.audit_logs + " แถว) · คงไว้: pallet_types, departments";
+  audit_("setting", "รีเซ็ตข้อมูล", detail);
+  teamsNotice_({ kind: "record", detail: detail, ref: "", page: "" });
   return {
     removed: removed,
     message: "รีเซ็ตข้อมูลแล้ว — ลบประวัติเคลื่อนไหว " + removed.movements + " แถว, งานซ่อม " +
@@ -869,27 +898,29 @@ function actionMovementUpdate_(input) {
   applyCopies_("movements", pMoves);
   applyCopies_("repairs", pRepairs);
 
-  audit_("pallet", "แก้ไขรายการ",
-    "แก้ไขรายการ " + m.doc_no + " (" + ACT_NAME[m.action] + " " + str_(t.code) + " ขนาด " + m.size + "): " +
-    parts.join("; ") + chainNote, m.doc_no);
+  var detail = "แก้ไขรายการ " + m.doc_no + " (" + ACT_NAME[m.action] + " " + str_(t.code) + " ขนาด " + m.size + "): " +
+    parts.join("; ") + chainNote;
+  audit_("pallet", "แก้ไขรายการ", detail, m.doc_no);
+  teamsNotice_({ kind: "record", detail: detail, ref: m.doc_no, page: "history" });
   return { changed: true, message: "แก้ไขรายการ " + m.doc_no + " แล้ว" };
 }
 
 function actionMovementDelete_(input) {
   var m = findMovement_(input);
-  if (m.repair_id != null) return deleteChain_(m.repair_id);
+  if (m.repair_id != null) return deleteChain_(m.repair_id, "history");
 
   var moves = table_("movements").rows;
   var proposed = moves.filter(function (r) { return r.id !== m.id; });
   validateLedger_(moves, proposed, "ลบไม่ได้");
-  var desc = describeMove_(m);
+  var detail = "ลบรายการ " + m.doc_no + ": " + describeMove_(m);
   delete_("movements", m);
-  audit_("pallet", "ลบรายการ", "ลบรายการ " + m.doc_no + ": " + desc, m.doc_no);
+  audit_("pallet", "ลบรายการ", detail, m.doc_no);
+  teamsNotice_({ kind: "record", detail: detail, ref: m.doc_no, page: "history" });
   return { removed: { movements: 1, repairs: 0 }, message: "ลบรายการ " + m.doc_no + " แล้ว" };
 }
 
 function actionRepairDelete_(input) {
-  return deleteChain_(findTicket_(input).id);
+  return deleteChain_(findTicket_(input).id, "repair");
 }
 
 function actionRepairUpdate_(input) {
@@ -920,12 +951,15 @@ function actionRepairUpdate_(input) {
   });
   if (!parts.length) return { changed: false, message: "ไม่มีการเปลี่ยนแปลง" };
   update_("repairs", rp, stampTicket_(ch));
-  audit_("repair", "แก้ไขใบแจ้งซ่อม", "แก้ไขใบแจ้งซ่อม " + rp.ticket_no + ": " + parts.join("; "), rp.ticket_no);
+  var detail = "แก้ไขใบแจ้งซ่อม " + rp.ticket_no + ": " + parts.join("; ");
+  audit_("repair", "แก้ไขใบแจ้งซ่อม", detail, rp.ticket_no);
+  teamsNotice_({ kind: "record", detail: detail, ref: rp.ticket_no, page: "repair" });
   return { changed: true, message: "แก้ไขใบแจ้งซ่อม " + rp.ticket_no + " แล้ว" };
 }
 
 // Deletes a repair ticket and every movement linked to it as one unit.
-function deleteChain_(rid) {
+// page: the site page the Teams card links to.
+function deleteChain_(rid, page) {
   var moves = table_("movements").rows;
   var chain = sortBy_(moves.filter(function (r) { return r.repair_id === rid; }), byMovedAsc_);
   var ticket = null;
@@ -940,9 +974,10 @@ function deleteChain_(rid) {
   var t = typeMap_()[(ticket || chain[0] || {}).type_id] || {};
   chain.forEach(function (c) { delete_("movements", c); });
   if (ticket) delete_("repairs", ticket);
-  audit_("pallet", "ลบรายการ",
-    "ลบรายการทั้งชุดงานซ่อม " + tno + " (" + str_(t.code) + " ขนาด " + str_((ticket || chain[0] || {}).size) + "): " +
-    (ticket ? "ใบแจ้งซ่อม + " : "") + chain.length + " รายการ — " + list.join(", "), tno);
+  var detail = "ลบรายการทั้งชุดงานซ่อม " + tno + " (" + str_(t.code) + " ขนาด " + str_((ticket || chain[0] || {}).size) + "): " +
+    (ticket ? "ใบแจ้งซ่อม + " : "") + chain.length + " รายการ — " + list.join(", ");
+  audit_("pallet", "ลบรายการ", detail, tno);
+  teamsNotice_({ kind: "record", detail: detail, ref: tno, page: page });
   return {
     removed: { movements: chain.length, repairs: ticket ? 1 : 0 },
     message: "ลบงานซ่อม " + tno + " ทั้งชุดแล้ว (ใบแจ้งซ่อม + " + chain.length + " รายการเคลื่อนไหว)"
@@ -1263,7 +1298,7 @@ function createTicket_(type, size, qty, source, dept, input, at) {
     repairer: "", reported_at: at, started_at: null, finished_at: null, note: textIn_(input, "note", MAX_REPAIR_NOTE, "หมายเหตุ"),
     updated_by: "", updated_username: "", updated_at: null
   });
-  return row.id;
+  return row;
 }
 
 // Adds "last changed by" (the actor) to a ticket change set / row.
@@ -1296,6 +1331,186 @@ function textIn_(input, key, max, label) {
   return value;
 }
 
+/* ===================== Microsoft Teams notifications =====================
+ *
+ * Actions call teamsNotice_() with the facts of what they changed (kept in
+ * REQ_, so a failed / rolled-back write never sends anything). runWrite_
+ * passes the notice to notifyTeams_() after the changes are flushed AND the
+ * script lock is released. One UrlFetchApp call per event; every error is
+ * caught and logged with console.warn (HTTP status only, never the URL).
+ */
+
+function teamsNotice_(notice) {
+  REQ_.teams = notice;
+}
+
+// Sends the card for a notice (nothing when TEAMS_WEBHOOK_URL is unset).
+// Never throws. Returns the HTTP status or null.
+function notifyTeams_(notice) {
+  var url = "";
+  try {
+    url = teamsWebhookUrl_();
+    if (!url) return null;
+    return sendTeams_(url, teamsCard_(notice)).status;
+  } catch (error) {
+    console.warn("Teams notification failed: " + scrubUrls_(errorMessage_(error), url));
+    return null;
+  }
+}
+
+// The webhook URL from Script Properties ("" = notifications off).
+function teamsWebhookUrl_() {
+  var url = phpTrim_(str_(PropertiesService.getScriptProperties().getProperty(TEAMS_WEBHOOK_PROPERTY)));
+  if (url && !/^https:\/\/\S+$/i.test(url)) {
+    console.warn("Teams notification skipped: " + TEAMS_WEBHOOK_PROPERTY + " must be an https:// URL");
+    return "";
+  }
+  return url;
+}
+
+// POSTs a message payload to the webhook -> {sent, status}. Never throws.
+function sendTeams_(url, payload) {
+  try {
+    var res = UrlFetchApp.fetch(url, {
+      method: "post",
+      contentType: "application/json",
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
+    var status = res.getResponseCode();
+    var sent = status >= 200 && status < 300;
+    if (!sent) console.warn("Teams notification failed: HTTP " + status);
+    return { sent: sent, status: status };
+  } catch (error) {
+    console.warn("Teams notification failed: " + scrubUrls_(errorMessage_(error), url));
+    return { sent: false, status: null };
+  }
+}
+
+// Removes URLs (the webhook URL carries its secret) from a log message.
+function scrubUrls_(text, url) {
+  var s = String(text);
+  if (url) s = s.split(url).join("[webhook]");
+  return s.replace(/https?:\/\/[^\s"'<>]+/gi, "[url]");
+}
+
+// Site link (Script Property PALLET_SITE_URL, default the GitHub Pages site) + #page.
+function siteUrl_(page) {
+  var base = "";
+  try { base = phpTrim_(str_(PropertiesService.getScriptProperties().getProperty(SITE_URL_PROPERTY))); } catch (ignored) {}
+  base = base.split("#")[0];
+  if (!/^https?:\/\/[^\s"'<>]+$/i.test(base)) base = DEFAULT_SITE_URL;
+  return base + (page ? "#" + page : "");
+}
+
+// Plain one-line card text: no control characters, at most max characters.
+function teamsText_(v, max) {
+  var s = str_(v).replace(/[\u0000-\u001F\u007F]+/g, " ").replace(/\s{2,}/g, " ");
+  s = phpTrim_(s);
+  if (mbLen_(s) > max) s = mbSubstr_(s, 0, max - 1) + "…";
+  return s;
+}
+
+function teamsType_(t) {
+  t = t || {};
+  return str_(t.code) + (t.name ? " — " + t.name : "");
+}
+
+// Adaptive Card message for a notice (the format a Teams Workflow webhook
+// "Post to a channel when a webhook request is received" expects).
+function teamsCard_(n) {
+  var tk = n.ticket || {};
+  var facts = [];
+  var fact = function (title, value) {
+    var v = teamsText_(value, TEAMS_MAX_FACT);
+    if (v !== "") facts.push({ title: title, value: v });
+  };
+  var title, page, detail = "";
+  var ticketFacts = function () {
+    fact("เลขที่ใบแจ้งซ่อม", tk.ticket_no);
+    fact("ประเภทพาเลท", teamsType_(n.type));
+    fact("ขนาด", tk.size ? tk.size + " ม." : "");
+    fact("จำนวน", tk.qty + " ตัว");
+  };
+  if (n.kind === "damage") {
+    title = "แจ้งชำรุด " + str_(tk.ticket_no);
+    page = "repair";
+    ticketFacts();
+    fact("ที่มา", tk.source === "issued" ? "รับคืนจาก " + str_(tk.department) : "จากคลัง (พร้อมใช้)");
+    fact("สาเหตุ", tk.cause || "-");
+  } else if (n.kind === "repair_done") {
+    title = "ซ่อมเสร็จ " + str_(tk.ticket_no);
+    page = "repair";
+    ticketFacts();
+    fact("ช่างผู้ซ่อม", tk.repairer);
+    fact("หมายเหตุ", n.note);
+  } else if (n.kind === "scrap") {
+    title = "ซ่อมไม่ได้ / ตัดจำหน่าย " + str_(tk.ticket_no);
+    page = "repair";
+    ticketFacts();
+    fact("จากสถานะ", STATUS_NAME[n.from] || n.from);
+    fact("หมายเหตุ", n.note);
+  } else if (n.kind === "record") {
+    title = (n.action === RESET_ACTION ? "รีเซ็ตข้อมูล" : (RECORD_ACT_NAME[n.action] || "แก้ไขข้อมูล")) + (n.ref ? " " + n.ref : "");
+    page = n.page || "";
+    detail = teamsText_(n.detail, TEAMS_MAX_DETAIL);
+  } else { // "test" (testTeamsNotification)
+    title = "ทดสอบการแจ้งเตือน";
+    page = "";
+    fact("ข้อความ", "ถ้าเห็นการ์ดนี้ แสดงว่าการแจ้งเตือน Teams ของ Pallet Hub ใช้งานได้");
+  }
+  if (n.doc_no) fact("เลขที่เอกสาร", n.doc_no);
+  if (n.at) fact("วันที่/เวลา", dtTh_(n.at) + " น.");
+  fact("ผู้ทำรายการ", n.actor || "-");
+
+  var body = [
+    { type: "TextBlock", text: "PALLET HUB", size: "Small", weight: "Bolder", color: "Attention", spacing: "None" },
+    { type: "TextBlock", text: teamsText_(title, 200), size: "Large", weight: "Bolder", color: "Attention", wrap: true, spacing: "Small" },
+    { type: "TextBlock", text: "แจ้งเมื่อ " + dtTh_(nowParts_().datetime) + " น. (เวลาไทย)", size: "Small", isSubtle: true, wrap: true, spacing: "None" }
+  ];
+  if (facts.length) body.push({ type: "FactSet", facts: facts, separator: true });
+  if (detail) body.push({ type: "TextBlock", text: detail, wrap: true, separator: true });
+
+  return {
+    type: "message",
+    attachments: [{
+      contentType: "application/vnd.microsoft.card.adaptive",
+      contentUrl: null,
+      content: {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        type: "AdaptiveCard",
+        version: "1.4",
+        msteams: { width: "Full" },
+        body: body,
+        actions: [{ type: "Action.OpenUrl", title: "เปิด Pallet Hub", url: siteUrl_(page) }]
+      }
+    }]
+  };
+}
+
+/**
+ * Run from the Apps Script editor: posts a sample card to the Teams channel of
+ * TEAMS_WEBHOOK_URL and returns / logs the HTTP status (2xx = OK; the URL is
+ * never logged). The first run asks to allow "Connect to an external service".
+ */
+function testTeamsNotification() {
+  var result;
+  var url = teamsWebhookUrl_();
+  if (!url) {
+    result = { sent: false, status: null, message: "ยังไม่ได้ตั้ง Script Property " + TEAMS_WEBHOOK_PROPERTY + " (ต้องเป็น URL https://)" };
+  } else {
+    var r = sendTeams_(url, teamsCard_({ kind: "test", actor: "ทดสอบจาก Apps Script editor" }));
+    result = {
+      sent: r.sent,
+      status: r.status,
+      message: r.sent ? "ส่งการ์ดทดสอบแล้ว (HTTP " + r.status + ") — ตรวจดูในช่อง Teams"
+        : "ส่งไม่สำเร็จ" + (r.status ? " (HTTP " + r.status + ")" : "") + " — ตรวจ URL ของ Workflow"
+    };
+  }
+  console.log(JSON.stringify(result));
+  return result;
+}
+
 /* ===================== sheet storage ===================== */
 
 var REQ_ = null; // per-request state: spreadsheet, loaded tables, pending writes
@@ -1305,6 +1520,7 @@ var REQ_ = null; // per-request state: spreadsheet, loaded tables, pending write
 function resetRequest_(actor) {
   REQ_ = {
     ss: null, tables: {}, appends: {}, updates: [], deletes: [], actor: actor || "", username: "",
+    teams: null,        // Teams notice of a successful write (sent by runWrite_ after the lock)
     dirty: {},          // sheets changed outside the buffers (reset_data) -> version bump on flush
     cacheReads: false,  // true only while answering read actions
     refreshCache: false, // keepWarm: read the sheets live and store them again (fresh TTL)
