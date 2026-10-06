@@ -1484,6 +1484,11 @@ function teamsCard_(n) {
  * never logged). The first run asks to allow "Connect to an external service".
  */
 function testTeamsNotification() {
+  // Google's per-scope consent lets users untick "Connect to an external
+  // service"; ask again for it here so the editor shows the consent dialog.
+  if (typeof ScriptApp !== "undefined" && ScriptApp.requireScopes) {
+    ScriptApp.requireScopes(ScriptApp.AuthMode.FULL, ["https://www.googleapis.com/auth/script.external_request"]);
+  }
   var result;
   var url = teamsWebhookUrl_();
   if (!url) {
