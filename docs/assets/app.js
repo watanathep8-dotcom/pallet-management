@@ -374,7 +374,7 @@ function askUserName(required = false) {
     if (!required) route();
   };
   $('#uSave', m).onclick = save;
-  inp.onkeydown = e => e.key === 'Enter' && save();
+  inp.onkeydown = e => { if (e.key === 'Enter') save(); };
   // Cancel / backdrop close: resolve with whatever name is set (possibly none).
   S.onModalClose = finish;
   });
@@ -727,7 +727,7 @@ async function logs() {
   // เปลี่ยนหมวด: ใช้ผลที่โหลดไว้แล้ว (กรองในหน้า) — โหลดใหม่เฉพาะเมื่อตัวกรองวันที่/คำค้นเปลี่ยน
   view.onclick = e => { const c = e.target.closest('[data-cat]'); if (c) { cat = c.dataset.cat; if (items && params(false) === loadedWith) show(); else load(); } };
   $('#lGo').onclick = load;
-  $('#lQ').onkeydown = e => e.key === 'Enter' && load();
+  $('#lQ').onkeydown = e => { if (e.key === 'Enter') load(); };
   $('#lCsv').onclick = () => downloadCsv('logs_export', params());
   load();
 }
@@ -1051,7 +1051,7 @@ async function history(initial) {
     if (ed) editMovement(m); else deleteMovement(m);
   };
   $('#hGo').onclick = load;
-  $('#hQ').onkeydown = e => e.key === 'Enter' && load();
+  $('#hQ').onkeydown = e => { if (e.key === 'Enter') load(); };
   $('#hCsv').onclick = () => downloadCsv('export', params());
   if (initial) { items = initial.items; show(); } else load(); // ผลเริ่มต้นมากับการเปิดหน้า (batch)
 }
