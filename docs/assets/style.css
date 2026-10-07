@@ -474,3 +474,8 @@ tfoot td{font-weight:700;background:#f1f5fd}
 .stile .size-badge{display:block;width:max-content;margin:-4px auto 12px;padding:6px 20px;border-radius:12px;font-family:'Kanit';font-weight:700;font-size:20px;letter-spacing:.5px;color:#fff;background:var(--c);box-shadow:0 8px 16px -8px var(--c)}
 tr.grp-row td{background:var(--brand-soft);color:var(--brand2);font-family:'Kanit';font-weight:600;font-size:15px}
 tr.sub-row td{background:#f6f3f3;font-weight:600;color:var(--ink)}
+
+/* "Programming by" credit — slow 7-colour cycle (same as the SDS site) */
+.programming-credit{font-size:11px;font-weight:700;letter-spacing:.02em;margin-top:2px;animation:rainbowText 21s ease-in-out infinite}
+@keyframes rainbowText{0%,100%{color:#ef4444}14.28%{color:#f97316}28.56%{color:#eab308}42.84%{color:#22c55e}57.12%{color:#06b6d4}71.4%{color:#3b82f6}85.68%{color:#8b5cf6}}
+@media (prefers-reduced-motion:reduce){.programming-credit{animation:none;color:#22c55e}}
