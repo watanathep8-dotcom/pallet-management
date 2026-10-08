@@ -1666,6 +1666,174 @@ test("a new repair ticket's note is limited like ticket edits (1000 characters)"
   okData(F.P(Object.assign({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 1, cause: "a", note: "  " + "x".repeat(1000) + "  " }, AT)));
 });
 
+/* ---------- partial repair steps (qty -> split ticket) ---------- */
+function splitInstance() {
+  const F = freshInstance();
+  const objs = n => { const d = F.ss.getSheetByName(n).data; return d.slice(1).filter(r => r.some(v => v !== "" && v != null)).map(r => Object.fromEntries(d[0].map((k, i) => [k, r[i]]))); };
+  F.mv = () => objs("movements");
+  F.tk = () => objs("repairs");
+  F.tkNo = no => F.tk().find(t => t.ticket_no === no);
+  F.chainOf = id => F.mv().filter(m => m.repair_id === id).sort((a, b) => a.moved_at < b.moved_at ? -1 : a.moved_at > b.moved_at ? 1 : a.id - b.id);
+  F.stock = st => stockOf(okData(F.G("bootstrap")).stock, 1, "1.2x1.2", st);
+  F.deptQ = () => (okData(F.G("bootstrap")).dept.find(d => d.department === "ฝ่ายผลิต") || { qty: 0 }).qty;
+  F.R = (action, body = {}) => F.P(Object.assign({}, body, { action, resetPassword: RPW }));
+  F.logs = () => okData(F.P({ action: "logs", resetPassword: RPW }, null)).items;
+  // every ticket's chain has the ticket's qty, and the sequence fits its stage
+  F.chainsOk = () => F.tk().forEach(t => {
+    const ch = F.chainOf(t.id);
+    assert.ok(ch.length > 0, t.ticket_no);
+    ch.forEach(m => assert.strictEqual(m.qty, t.qty, `${t.ticket_no} ${m.doc_no}`));
+    const seq = ch.map(m => m.action).join(",");
+    const ok = { damaged: ["damage"], repairing: ["damage,repair_start"], done: ["damage,repair_start,repair_done"], scrapped: ["damage,scrap", "damage,repair_start,scrap"] }[t.stage];
+    assert.ok(ok.includes(seq), `${t.ticket_no} ${t.stage}: ${seq}`);
+  });
+  const d = (date, time) => ({ date, time });
+  okData(F.P(Object.assign({ action: "receive", type_id: 1, size: "1.2x1.2", qty: 30 }, d("2026-03-01", "08:00"))));
+  okData(F.P(Object.assign({ action: "issue", type_id: 1, size: "1.2x1.2", qty: 25, department: "ฝ่ายผลิต" }, d("2026-03-01", "08:30"))));
+  okData(F.P(Object.assign({ action: "return", type_id: 1, size: "1.2x1.2", qty: 21, department: "ฝ่ายผลิต", condition: "damaged", cause: "ไม้หัก", person: "คนคืน", note: "n0" }, d("2026-03-01", "09:00"))));
+  F.A = F.tk()[0];
+  return F;
+}
+
+test("partial repair: invalid qty rejected (Thai), nothing written; qty never checked past the stage", () => {
+  const F = splitInstance();
+  const A = F.A;
+  const data = () => JSON.stringify(["movements", "repairs"].map(n => F.ss.getSheetByName(n).data));
+  const before = data();
+  const go = (act, qty) => F.P({ action: act, id: A.id, ticket_no: A.ticket_no, qty, date: "2026-03-01", time: "10:00" });
+  for (const act of ["repair_start", "scrap"]) {
+    err(go(act, "abc"), /^จำนวนต้องเป็นตัวเลขจำนวนเต็ม$/);
+    err(go(act, "1.5"), /^จำนวนต้องเป็นตัวเลขจำนวนเต็ม$/);
+    err(go(act, 2.5), /^จำนวนต้องเป็นตัวเลขจำนวนเต็ม$/);
+    err(go(act, 0), /^จำนวนต้องมากกว่า 0$/);
+    err(go(act, "-3"), /^จำนวนต้องมากกว่า 0$/);
+    err(go(act, 22), new RegExp(`^ใบแจ้งซ่อม ${A.ticket_no} มีเพียง 21 ตัว$`));
+  }
+  err(go("repair_done", 3), /^ใบนี้ไม่ได้อยู่ระหว่างซ่อม$/);
+  err(F.P({ action: "repair_start", id: A.id, qty: 5, date: "2026-03-01", time: "08:59" }), /ก่อนขั้นตอนก่อนหน้า/);
+  assert.strictEqual(data(), before);
+  assert.strictEqual(F.logs()[0].category, "warn");
+  assert.strictEqual(F.tk().length, 1);
+});
+
+test("partial repair: send 6 of 21, finish 4 of 6, scrap 2 of the rest -> split tickets, totals as if moved directly", () => {
+  const F = splitInstance();
+  const A = F.A;
+  const A2 = A.ticket_no + "-2", A3 = A.ticket_no + "-3", A4 = A.ticket_no + "-4";
+  assert.strictEqual(A.qty, 21);
+  assert.strictEqual(F.stock("damaged"), 21);
+  assert.strictEqual(F.deptQ(), 4);
+
+  // --- send 6 of 21 to repair
+  const s = okData(F.P({ action: "repair_start", id: A.id, ticket_no: A.ticket_no, qty: "6", person: "ช่างหนึ่ง", date: "2026-03-01", time: "10:00" }));
+  assert.strictEqual(s.message, `ส่งซ่อม 6 ตัว จาก ${A.ticket_no} แล้ว (แยกเป็นใบ ${A2})`);
+  let a = F.tkNo(A.ticket_no), b = F.tkNo(A2);
+  assert.deepStrictEqual([a.qty, a.stage, a.started_at, a.repairer], [15, "damaged", "", ""]);
+  assert.deepStrictEqual([b.qty, b.stage, b.started_at, b.repairer], [6, "repairing", "2026-03-01 10:00:00", "ช่างหนึ่ง"]);
+  // the new ticket carries the original report
+  for (const k of ["type_id", "size", "source", "department", "cause", "reported_by", "reported_at"]) assert.strictEqual(b[k], a[k], k);
+  assert.strictEqual(b.note, `n0\nแยกจาก ${A.ticket_no} (6 จาก 21 ตัว)`);
+  assert.strictEqual(a.note, `n0\nแยก 6 ตัว ไปใบ ${A2} (เหลือ 15 ตัว)`);
+  assert.strictEqual(b.updated_by, TESTER);
+  // chain copies: same moved_at / statuses / department / person / note / actor, new doc no
+  const [dmA] = F.chainOf(a.id);
+  const [dmB, rpB] = F.chainOf(b.id);
+  assert.strictEqual(dmA.qty, 15);
+  assert.strictEqual(dmB.doc_no, "DM-" + YMD + "-0002");
+  for (const k of ["action", "type_id", "size", "from_status", "to_status", "department", "person", "note", "moved_at", "actor"]) assert.strictEqual(dmB[k], dmA[k], k);
+  assert.deepStrictEqual([dmB.qty, rpB.action, rpB.qty, rpB.note, rpB.person, rpB.doc_no], [6, "repair_start", 6, A2, "ช่างหนึ่ง", s.doc_no]);
+  assert.deepStrictEqual([F.stock("damaged"), F.stock("repairing"), F.stock("available"), F.stock("issued"), F.deptQ()], [15, 6, 5, 4, 4]);
+  // audit: the split, then the step
+  const [l1, l2] = F.logs();
+  assert.deepStrictEqual([l1.action, l1.ref], ["repair_start", s.doc_no]);
+  assert.deepStrictEqual([l2.category, l2.action, l2.ref], ["repair", "แยกใบแจ้งซ่อม", A2]);
+  assert.strictEqual(l2.detail, `แยกใบแจ้งซ่อม ${A.ticket_no} → ${A2} (RM ขนาด 1.2x1.2): 6 จาก 21 ตัว · ใบเดิมเหลือ 15 ตัว · คัดลอกรายการ DM-${YMD}-0002 (จาก DM-${YMD}-0001)`);
+  F.chainsOk();
+  // repairs page shows both tickets in their columns
+  const items = okData(F.G("repairs")).items;
+  assert.deepStrictEqual(items.filter(i => i.stage === "damaged").map(i => i.qty), [15]);
+  assert.deepStrictEqual(items.filter(i => i.stage === "repairing").map(i => i.qty), [6]);
+
+  // --- finish 4 of the 6 (root numbering: -3, not -2-2)
+  const dn = okData(F.P({ action: "repair_done", id: b.id, ticket_no: A2, qty: 4, note: "เปลี่ยนไม้", date: "2026-03-01", time: "11:00" }));
+  assert.strictEqual(dn.message, `ซ่อมเสร็จ 4 ตัว กลับเข้าคลังพร้อมใช้ (แยกจาก ${A2} เป็นใบ ${A3})`);
+  b = F.tkNo(A2);
+  const c = F.tkNo(A3);
+  assert.deepStrictEqual([b.qty, b.stage], [2, "repairing"]);
+  assert.deepStrictEqual([c.qty, c.stage, c.started_at, c.finished_at, c.repairer], [4, "done", "2026-03-01 10:00:00", "2026-03-01 11:00:00", "ช่างหนึ่ง"]);
+  assert.strictEqual(c.note, `n0\nแยกจาก ${A.ticket_no} (6 จาก 21 ตัว)\nแยกจาก ${A2} (4 จาก 6 ตัว)\nซ่อมเสร็จ: เปลี่ยนไม้`);
+  const chC = F.chainOf(c.id);
+  assert.deepStrictEqual(chC.map(m => [m.action, m.qty]), [["damage", 4], ["repair_start", 4], ["repair_done", 4]]);
+  assert.strictEqual(chC[1].note, A3); // RP note re-pointed at the new ticket
+  assert.strictEqual(chC[1].moved_at, "2026-03-01 10:00:00");
+  assert.deepStrictEqual(F.chainOf(b.id).map(m => m.qty), [2, 2]);
+  assert.deepStrictEqual([F.stock("damaged"), F.stock("repairing"), F.stock("available"), F.deptQ()], [15, 2, 9, 4]);
+  F.chainsOk();
+
+  // --- scrap 2 of the 15 still damaged
+  const sc = okData(F.P({ action: "scrap", id: A.id, ticket_no: A.ticket_no, qty: 2, note: "แตก", date: "2026-03-01", time: "12:00" }));
+  assert.strictEqual(sc.message, `ตัดจำหน่าย 2 ตัว แล้ว (แยกจาก ${A.ticket_no} เป็นใบ ${A4})`);
+  const d4 = F.tkNo(A4);
+  assert.deepStrictEqual([F.tkNo(A.ticket_no).qty, F.tkNo(A.ticket_no).stage, d4.qty, d4.stage], [13, "damaged", 2, "scrapped"]);
+  assert.deepStrictEqual(F.chainOf(d4.id).map(m => [m.action, m.qty, m.from_status, m.note]), [["damage", 2, "issued", "คืนสภาพชำรุด: ไม้หัก"], ["scrap", 2, "damaged", A4 + " แตก"]]);
+  assert.deepStrictEqual([F.stock("damaged"), F.stock("repairing"), F.stock("available"), F.stock("scrapped"), F.deptQ()], [13, 2, 9, 2, 4]);
+  F.chainsOk();
+  // history exposes each copy's own ticket; ticket count by stage
+  assert.strictEqual(okData(F.G("history", { q: "DM-" + YMD + "-0002" })).items[0].ticket_no, A2);
+  assert.strictEqual(F.tk().length, 4);
+
+  // --- full qty (explicit or missing) behaves exactly as before: no split
+  const full = okData(F.P({ action: "scrap", id: b.id, ticket_no: A2, qty: "2", date: "2026-03-01", time: "13:00" }));
+  assert.strictEqual(full.message, "ตัดจำหน่าย 2 ตัว แล้ว");
+  const st0 = okData(F.P({ action: "repair_start", id: A.id, ticket_no: A.ticket_no, qty: "", date: "2026-03-01", time: "13:00" }));
+  assert.strictEqual(st0.message, `ส่งซ่อม ${A.ticket_no} แล้ว`);
+  assert.strictEqual(F.tk().length, 4);
+  assert.notStrictEqual(F.logs()[1].action, "แยกใบแจ้งซ่อม");
+  assert.deepStrictEqual([F.stock("damaged"), F.stock("repairing"), F.stock("available"), F.stock("scrapped")], [0, 13, 9, 4]);
+  F.chainsOk();
+});
+
+test("partial repair: split chains stay editable / deletable as one unit; next split numbers never reuse deleted ones", () => {
+  const F = splitInstance();
+  const A = F.A;
+  okData(F.P({ action: "repair_start", id: A.id, ticket_no: A.ticket_no, qty: 6, date: "2026-03-01", time: "10:00" }));
+  const b = F.tkNo(A.ticket_no + "-2");
+  okData(F.P({ action: "repair_done", id: b.id, qty: 4, date: "2026-03-01", time: "11:00" }));
+  const c = F.tkNo(A.ticket_no + "-3");
+  // qty edit on the copied damage row of -3 propagates to its whole chain only
+  const [dmC] = F.chainOf(c.id);
+  const e = okData(F.R("movement_update", { id: dmC.id, doc_no: dmC.doc_no, qty: 5 }));
+  assert.strictEqual(e.changed, true);
+  assert.deepStrictEqual(F.chainOf(c.id).map(m => m.qty), [5, 5, 5]);
+  assert.strictEqual(F.tkNo(c.ticket_no).qty, 5);
+  assert.deepStrictEqual([F.tkNo(A.ticket_no).qty, F.tkNo(b.ticket_no).qty], [15, 2]);
+  assert.deepStrictEqual([F.stock("damaged"), F.stock("repairing"), F.stock("available"), F.deptQ()], [15, 2, 10, 3]);
+  F.chainsOk();
+  // the original's qty edit still works (15 -> 14)
+  const [dmA] = F.chainOf(A.id);
+  okData(F.R("movement_update", { id: dmA.id, doc_no: dmA.doc_no, qty: 14 }));
+  assert.strictEqual(F.tkNo(A.ticket_no).qty, 14);
+  F.chainsOk();
+  // delete the -2 chain (via its repair_start row): its 2 movements + ticket only
+  const rpB = F.chainOf(b.id)[1];
+  const del = okData(F.R("movement_delete", { id: rpB.id, doc_no: rpB.doc_no }));
+  assert.deepStrictEqual(del.removed, { movements: 2, repairs: 1 });
+  assert.ok(!F.tkNo(b.ticket_no));
+  assert.deepStrictEqual([F.stock("damaged"), F.stock("repairing"), F.stock("available"), F.stock("issued"), F.deptQ()], [14, 0, 10, 6, 6]);
+  F.chainsOk();
+  // repair_delete of a split ticket too
+  okData(F.R("repair_delete", { id: c.id, ticket_no: c.ticket_no }));
+  assert.deepStrictEqual(F.tk().map(t => t.ticket_no), [A.ticket_no]);
+  // a new split never reuses -2 / -3 (still in the audit log)
+  okData(F.P({ action: "scrap", id: A.id, qty: 1, date: "2026-03-01", time: "12:00" }));
+  assert.ok(F.tkNo(A.ticket_no + "-4"));
+  assert.deepStrictEqual([F.stock("damaged"), F.stock("scrapped")], [13, 1]);
+  F.chainsOk();
+  // a later ordinary ticket number is not affected by the suffixes
+  okData(F.P({ action: "damage", type_id: 1, size: "1.2x1.2", qty: 1, cause: "x", date: "2026-03-01", time: "13:00" }));
+  assert.strictEqual(F.tk().pop().ticket_no, "RPR-" + YMD + "-0002");
+});
+
 /* ---------- Microsoft Teams notifications ---------- */
 // A Workflows webhook URL carries its signature in the query string: it must never leak.
 const HOOK = "https://prod-00.southeastasia.logic.azure.com:443/workflows/0a1b2c/triggers/manual/paths/invoke?api-version=2016-06-01&sp=%2Ftriggers&sv=1.0&sig=SECRET-SIG-123";
@@ -1932,6 +2100,19 @@ test("frontend fixes: no double submit, qty field, deleted departments on return
   assert.ok(/INPUT_PAGES = \['receive', 'issue', 'return', 'damage', 'history', 'settings'\]/.test(app));
 });
 
+test("frontend: repair step dialog has a qty input (1..ticket qty, default all, only when qty > 1) and sends qty", () => {
+  const app = fs.readFileSync(path.join(ROOT, "docs/assets/app.js"), "utf8");
+  const i = app.indexOf("function repairAction(");
+  const src = app.slice(i, app.indexOf("\nfunction ", i + 10));
+  assert.ok(src.includes("const max = +r.qty;"));
+  assert.ok(src.includes("${max > 1 ? `"));
+  assert.ok(/id="mQty" type="number"[^>]*min="1" max="\$\{max\}"[^>]*value="\$\{max\}"/.test(src));
+  assert.ok(src.includes("จำนวน (สูงสุด ${fmt(max)} ตัว)"));
+  assert.ok(/writeApi\(act, \{ id: r\.id, ticket_no: r\.ticket_no, qty: qVal\(\),/.test(src));
+  assert.ok(/go\.onclick = async \(\) => \{\s*if \(!qOk\(\)\) \{.*return; \}/.test(src), "invalid qty never sent");
+  assert.ok(!/on(keydown|keyup|keypress|input) = [^;]*&&/.test(src), "no handler that can return false");
+});
+
 test("docs JS files parse (new Function); no login UI; reset password never stored; cache-buster", () => {
   for (const f of ["docs/config.js", "docs/assets/app.js"]) {
     const src = fs.readFileSync(path.join(ROOT, f), "utf8");
@@ -1955,7 +2136,7 @@ test("docs JS files parse (new Function); no login UI; reset password never stor
   assert.ok(!/palletRC[^\n]*logs/.test(app));
   assert.ok(app.includes("ผู้ทำรายการ / By"));
   const html = fs.readFileSync(path.join(ROOT, "docs/index.html"), "utf8");
-  assert.ok(html.includes('assets/app.js?v=22"'));
+  assert.ok(html.includes('assets/app.js?v=23"'));
   assert.ok(!html.includes('id="loginScreen"') && !html.includes('data-page="account"') && !html.includes("umLogout"));
   assert.ok(html.includes('id="userChip"') && html.includes('data-page="logs"'));
   assert.ok(/<link rel="preconnect" href="https:\/\/script\.google\.com"/.test(html) && /script\.googleusercontent\.com/.test(html));

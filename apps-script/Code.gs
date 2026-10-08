@@ -681,24 +681,33 @@ function actionDamage_(input) {
 function actionRepairStart_(input) {
   var rp = repairIn_(input);
   if (rp.stage !== "damaged") fail_("ใบนี้ไม่ได้อยู่สถานะชำรุด");
+  var qty = repairQty_(input, rp);
   var at = moment_(input);
   assertAfterChain_(rp, at);
   var person = textIn_(input, "person", MAX_PERSON, "ชื่อผู้ทำรายการ");
+  var sp = splitTicket_(rp, qty);
+  rp = sp.ticket;
   update_("repairs", rp, stampTicket_({ stage: "repairing", started_at: at, repairer: phpTruthy_(person) ? person : actorName_() }));
   var r = move_("repair_start", rp.type_id, rp.size, rp.qty, "damaged", "repairing",
     { person: rp.repairer, note: rp.ticket_no, repair_id: rp.id, moved_at: at });
-  r.message = "ส่งซ่อม " + rp.ticket_no + " แล้ว";
+  checkSplit_(sp);
+  r.message = sp.from
+    ? "ส่งซ่อม " + qty + " ตัว จาก " + sp.from.ticket_no + " แล้ว (แยกเป็นใบ " + rp.ticket_no + ")"
+    : "ส่งซ่อม " + rp.ticket_no + " แล้ว";
   return r;
 }
 
 function actionRepairDone_(input) {
   var rp = repairIn_(input);
   if (rp.stage !== "repairing") fail_("ใบนี้ไม่ได้อยู่ระหว่างซ่อม");
+  var qty = repairQty_(input, rp);
   var at = moment_(input);
   assertAfterChain_(rp, at);
   var rawNote = safeStr_(input.note);
   if (mbLen_(rawNote) > MAX_REPAIR_NOTE) fail_("หมายเหตุยาวเกิน " + MAX_REPAIR_NOTE + " ตัวอักษร");
   var person = textIn_(input, "person", MAX_PERSON, "ชื่อผู้ทำรายการ");
+  var sp = splitTicket_(rp, qty);
+  rp = sp.ticket;
   update_("repairs", rp, stampTicket_({
     stage: "done",
     finished_at: at,
@@ -706,23 +715,118 @@ function actionRepairDone_(input) {
   }));
   var r = move_("repair_done", rp.type_id, rp.size, rp.qty, "repairing", "available",
     { person: phpTruthy_(person) ? person : rp.repairer, note: rp.ticket_no, repair_id: rp.id, moved_at: at });
-  r.message = "ซ่อมเสร็จ " + rp.qty + " ตัว กลับเข้าคลังพร้อมใช้";
+  checkSplit_(sp);
+  r.message = "ซ่อมเสร็จ " + rp.qty + " ตัว กลับเข้าคลังพร้อมใช้" +
+    (sp.from ? " (แยกจาก " + sp.from.ticket_no + " เป็นใบ " + rp.ticket_no + ")" : "");
   return r;
 }
 
 function actionScrap_(input) {
   var rp = repairIn_(input);
   if (rp.stage !== "damaged" && rp.stage !== "repairing") fail_("ไม่สามารถตัดจำหน่ายใบนี้ได้");
+  var qty = repairQty_(input, rp);
   var at = moment_(input);
   assertAfterChain_(rp, at);
   var person = textIn_(input, "person", MAX_PERSON, "ชื่อผู้ทำรายการ");
   var note = textIn_(input, "note", MAX_TEXT, "หมายเหตุ");
+  var sp = splitTicket_(rp, qty);
+  rp = sp.ticket;
   var fromStage = rp.stage;
   update_("repairs", rp, stampTicket_({ stage: "scrapped", finished_at: at }));
   var r = move_("scrap", rp.type_id, rp.size, rp.qty, fromStage, "scrapped",
     { person: person, note: rp.ticket_no + " " + note, repair_id: rp.id, moved_at: at });
-  r.message = "ตัดจำหน่าย " + rp.qty + " ตัว แล้ว";
+  checkSplit_(sp);
+  r.message = "ตัดจำหน่าย " + rp.qty + " ตัว แล้ว" +
+    (sp.from ? " (แยกจาก " + sp.from.ticket_no + " เป็นใบ " + rp.ticket_no + ")" : "");
   return r;
+}
+
+/* ---- partial repair steps (split a ticket) ----
+ *
+ * repair_start / repair_done / scrap take an optional qty. Missing, empty or
+ * equal to the ticket qty -> the whole ticket moves (as before). 1..qty-1 ->
+ * the ticket is SPLIT first: the moved part becomes a new ticket
+ * (<root ticket_no>-2, -3, ...) carrying copies of the chain's earlier
+ * movements with the moved qty (same moved_at / type / size / department /
+ * person / note / actor; new doc numbers), while the original ticket and its
+ * movements are reduced by that qty and keep their stage. Both tickets keep
+ * the repair-chain invariant (one qty for a ticket and all its movements) and
+ * stock / department totals equal those of moving qty directly. The step then
+ * acts on the new ticket. Buffered like every write: a failure writes nothing.
+ */
+function repairQty_(input, rp) {
+  var raw = input.qty == null ? "" : phpTrim_(safeStr_(input.qty));
+  if (raw === "") return rp.qty;
+  if (!/^-?\d+$/.test(raw)) fail_("จำนวนต้องเป็นตัวเลขจำนวนเต็ม");
+  var qty = Number(raw);
+  if (qty <= 0) fail_("จำนวนต้องมากกว่า 0");
+  if (qty > rp.qty) fail_("ใบแจ้งซ่อม " + rp.ticket_no + " มีเพียง " + rp.qty + " ตัว");
+  return qty;
+}
+
+// Ticket number for a part split off a ticket: <root>-2, <root>-3, ... where
+// root = RPR-YYMMDD-NNNN (also when a split part is split again). Audit refs
+// are scanned too, so a number freed by a delete is never handed out again.
+function splitNo_(ticketNo) {
+  var root = String(ticketNo).split("-").slice(0, 3).join("-");
+  var tag = root.toUpperCase() + "-";
+  var max = 1;
+  var scan = function (v) {
+    var s = String(v || "").toUpperCase();
+    if (s.indexOf(tag) !== 0) return;
+    var rest = s.slice(tag.length);
+    if (/^\d+$/.test(rest) && Number(rest) > max) max = Number(rest);
+  };
+  table_("repairs").rows.forEach(function (r) { scan(r.ticket_no); });
+  table_("audit_logs").rows.forEach(function (l) { scan(l.ref); });
+  return root + "-" + (max + 1);
+}
+
+// Returns { ticket } = the ticket the step acts on; after a split also
+// { from, before } = the original ticket and the movements as they were.
+function splitTicket_(rp, qty) {
+  if (qty === rp.qty) return { ticket: rp, from: null };
+  var moves = table_("movements").rows;
+  var before = cloneRows_(moves);
+  var chain = sortBy_(moves.filter(function (m) { return m.repair_id === rp.id; }), byMovedAsc_);
+  var newNo = splitNo_(rp.ticket_no);
+  var rest = rp.qty - qty;
+  var note = str_(rp.note);
+  var tk = insert_("repairs", stampTicket_({
+    ticket_no: newNo, type_id: rp.type_id, size: rp.size, qty: qty, stage: rp.stage, source: rp.source,
+    department: rp.department, cause: rp.cause, reported_by: rp.reported_by, reported_username: rp.reported_username,
+    repairer: rp.repairer, reported_at: rp.reported_at, started_at: rp.started_at, finished_at: rp.finished_at,
+    note: (note ? note + "\n" : "") + "แยกจาก " + rp.ticket_no + " (" + qty + " จาก " + rp.qty + " ตัว)"
+  }));
+  update_("repairs", rp, stampTicket_({
+    qty: rest,
+    note: (note ? note + "\n" : "") + "แยก " + qty + " ตัว ไปใบ " + newNo + " (เหลือ " + rest + " ตัว)"
+  }));
+  var copies = chain.map(function (m) {
+    var mNote = str_(m.note);
+    if (mNote.indexOf(rp.ticket_no) === 0) mNote = newNo + mNote.slice(rp.ticket_no.length); // RP/RD/SC notes start with the ticket no
+    var c = insert_("movements", {
+      doc_no: nextNo_(PREFIX[m.action], "movements", "doc_no"), action: m.action, type_id: m.type_id, size: m.size, qty: qty,
+      from_status: m.from_status, to_status: m.to_status, department: m.department, person: m.person, note: mNote,
+      repair_id: tk.id, moved_at: m.moved_at, created_at: nowParts_().datetime, actor: m.actor, username: m.username
+    });
+    update_("movements", m, { qty: rest });
+    return c.doc_no + " (จาก " + m.doc_no + ")";
+  });
+  var t = typeMap_()[rp.type_id] || {};
+  audit_("repair", "แยกใบแจ้งซ่อม", "แยกใบแจ้งซ่อม " + rp.ticket_no + " → " + newNo + " (" + str_(t.code) + " ขนาด " + rp.size +
+    "): " + qty + " จาก " + (rest + qty) + " ตัว · ใบเดิมเหลือ " + rest + " ตัว · คัดลอกรายการ " + copies.join(", "), newNo);
+  return { ticket: tk, from: rp, before: before };
+}
+
+// After a split (and the step itself): replay the ledger and check both
+// chains; a failure throws before anything is written.
+function checkSplit_(sp) {
+  if (!sp.from) return;
+  var verb = "แยกใบแจ้งซ่อมไม่ได้";
+  var moves = table_("movements").rows;
+  validateLedger_(sp.before, moves, verb);
+  checkChains_(moves, table_("repairs").rows, [sp.from.id, sp.ticket.id], verb);
 }
 
 function actionDeptSave_(input) {

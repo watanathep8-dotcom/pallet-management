@@ -928,9 +928,13 @@ function repairAction(r, act) {
     scrap: ['ตัดจำหน่าย (ซ่อมไม่ได้)', 'fa-trash-can', 'btn-bad', 'ชื่อผู้อนุมัติ (ไม่บังคับ)', 'ออกจากระบบ'],
   }[act];
   const n = nowParts();
+  const max = +r.qty;
   const m = modal(`<h3><i class="fa-solid ${meta[1]}"></i> ${meta[0]}</h3>
     <p style="color:var(--muted)">${esc(r.ticket_no)} · ${esc(r.code)} ${esc(r.size)} ม. · ${fmt(r.qty)} ตัว — <b>${meta[4]}</b></p>
     <div style="text-align:center">${palletSVG(r.color, 'big-pal')}</div>
+    ${max > 1 ? `<div class="field mt"><label for="mQty">จำนวน (สูงสุด ${fmt(max)} ตัว)</label>
+      <div class="stepper"><button type="button" data-mq="-1" aria-label="ลด"><i class="fa-solid fa-minus"></i></button><input id="mQty" type="number" inputmode="numeric" min="1" max="${max}" step="1" value="${max}"><button type="button" data-mq="1" aria-label="เพิ่ม"><i class="fa-solid fa-plus"></i></button></div>
+      <p class="hint" id="mQtyHint" style="font-size:12.5px;margin-top:6px"></p></div>` : ''}
     <div class="fields mt">
       <div class="field"><label>วันที่</label><input type="date" id="mDate" value="${n.date}"></div>
       <div class="field"><label>เวลา</label><input type="time" id="mTime" value="${n.time}"></div>
@@ -940,11 +944,32 @@ function repairAction(r, act) {
     <p class="hint" style="font-size:12.5px;margin-top:10px"><i class="fa-solid fa-user-check" style="color:var(--ok)"></i> ผู้ทำรายการ: <b>${esc(meLabel())}</b> (ชื่อผู้ใช้งานมุมขวาบน)</p>
     <div class="modal-acts"><button class="btn btn-ghost" data-close>ยกเลิก</button><button class="btn ${meta[2]}" id="mGo"><i class="fa-solid ${meta[1]}"></i>${meta[0]}</button></div>`);
   const go = $('#mGo', m);
+  // จำนวนบางส่วน: น้อยกว่าทั้งใบ → ระบบแยกส่วนที่เลือกเป็นใบแจ้งซ่อมใหม่
+  const qIn = $('#mQty', m);
+  const qVal = () => qIn ? Number(qIn.value) : max;
+  const qOk = () => Number.isInteger(qVal()) && qVal() >= 1 && qVal() <= max;
+  const qHint = () => {
+    if (!qIn) return;
+    const q = qVal();
+    $('#mQtyHint', m).innerHTML = !qOk() ? `<span style="color:var(--bad)">กรุณาระบุจำนวน 1–${fmt(max)} ตัว</span>`
+      : q < max ? `<i class="fa-solid fa-code-branch"></i> แยก ${fmt(q)} ตัวเป็นใบใหม่ · ใบ ${esc(r.ticket_no)} เหลือ ${fmt(max - q)} ตัว (สถานะเดิม)`
+      : `ทั้งใบ (${fmt(max)} ตัว)`;
+  };
+  if (qIn) {
+    m.querySelectorAll('[data-mq]').forEach(b => b.onclick = () => {
+      const q = (Number.isInteger(qVal()) ? qVal() : max) + +b.dataset.mq;
+      qIn.value = Math.min(max, Math.max(1, q));
+      qHint();
+    });
+    qIn.oninput = qHint;
+    qHint();
+  }
   go.onclick = async () => {
+    if (!qOk()) { toast(`กรุณาระบุจำนวน 1–${fmt(max)} ตัว`, 'err'); qIn.focus(); return; }
     if (go.disabled) return;
     go.disabled = true;
     try {
-      const res = await writeApi(act, { id: r.id, ticket_no: r.ticket_no, date: $('#mDate').value, time: $('#mTime').value, person: $('#mPerson').value, note: $('#mNote').value });
+      const res = await writeApi(act, { id: r.id, ticket_no: r.ticket_no, qty: qVal(), date: $('#mDate').value, time: $('#mTime').value, person: $('#mPerson').value, note: $('#mNote').value });
       closeModal();
       if (act === 'repair_done') confetti();
       toast(res.message);
