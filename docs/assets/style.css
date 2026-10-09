@@ -97,7 +97,7 @@ input,select,textarea{font:inherit;color:inherit}
 .card h3 i{color:var(--brand)}
 .card h3 .sub{margin-left:auto;font-size:13px;color:var(--muted);font-weight:400;font-family:'Prompt'}
 .grid{display:grid;gap:18px}
-.g-kpi{grid-template-columns:repeat(5,1fr)}
+.g-kpi{grid-template-columns:repeat(6,1fr)}
 .g-types{grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
 .g-2{grid-template-columns:1.4fr 1fr}
 .g-3{grid-template-columns:1fr 1fr 1fr}

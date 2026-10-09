@@ -2136,7 +2136,7 @@ test("docs JS files parse (new Function); no login UI; reset password never stor
   assert.ok(!/palletRC[^\n]*logs/.test(app));
   assert.ok(app.includes("ผู้ทำรายการ / By"));
   const html = fs.readFileSync(path.join(ROOT, "docs/index.html"), "utf8");
-  assert.ok(html.includes('assets/app.js?v=23"'));
+  assert.ok(html.includes('assets/app.js?v=24"'));
   assert.ok(!html.includes('id="loginScreen"') && !html.includes('data-page="account"') && !html.includes("umLogout"));
   assert.ok(html.includes('id="userChip"') && html.includes('data-page="logs"'));
   assert.ok(/<link rel="preconnect" href="https:\/\/script\.google\.com"/.test(html) && /script\.googleusercontent\.com/.test(html));

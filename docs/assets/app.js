@@ -481,6 +481,7 @@ async function dashboard(d) {
     ['เบิกไปใช้งาน', qAll('issued'), 'fa-dolly', STATUS.issued.c, `${pct('issued')}% · อยู่กับ ${new Set(S.dept.map(r => r.department)).size} ฝ่าย`],
     ['ชำรุด / รอซ่อม', qAll('damaged'), 'fa-triangle-exclamation', STATUS.damaged.c, `แจ้งวันนี้ ${fmt(today.damage)} ตัว`],
     ['กำลังซ่อม', qAll('repairing'), 'fa-screwdriver-wrench', STATUS.repairing.c, `ซ่อมเสร็จวันนี้ ${fmt(today.repair_done)} ตัว`],
+    ['ตัดจำหน่าย', qAll('scrapped'), STATUS.scrapped.icon, '#667085', `สะสม · วันนี้ ${fmt(today.scrap)} ตัว`],
   ];
   const fnode = (s, extra = '') => `<div class="fnode" style="--c:${STATUS[s].c}" data-go="${s === 'issued' ? 'stock' : s === 'available' ? 'issue' : 'repair'}">
       <em>${pct(s)}%</em><div class="fi"><i class="fa-solid ${STATUS[s].icon}"></i></div><b data-count="${qAll(s)}">0</b><span>${STATUS[s].name}${extra}</span></div>`;
